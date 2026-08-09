@@ -1,0 +1,24 @@
+{
+  "name": "tennis-bot",
+  "version": "1.0.0",
+  "description": "Discord tennis stats bot with live match analysis from Kalshi",
+  "main": "tennis-bot.js",
+  "scripts": {
+    "start": "node tennis-bot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "tennis",
+    "discord",
+    "bot",
+    "kalshi",
+    "stats",
+    "prediction"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "axios": "^1.7.9"
+  }
+}
