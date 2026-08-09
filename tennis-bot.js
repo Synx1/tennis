@@ -456,11 +456,50 @@ function liveDetailEmbed(detail) {
     em.addFields({ name: 'Recent games (oldest first)', value: lines.join('\n').slice(0, 1024) });
   }
 
+  /**
+   * Break potential, derived from the points rather than read from a stats feed.
+   *
+   * This is the block that makes ITF useful: that level publishes no statistics at
+   * all, but the point sequence is there, so return pressure can be counted directly.
+   * A return game where the returner reached 30 or 40 is a game where the break was
+   * live, counted once per game — the same definition used for charted career data, so
+   * the live figure and the career figure mean the same thing.
+   */
+  if (detail.hasPoints && detail.derived) {
+    const d = detail.derived;
+    const pct = v => v == null ? '—' : `${Math.round(v * 100)}%`;
+    const side = (s, name) => {
+      const x = d[s];
+      if (!x.returnGames && !x.serviceGames) return null;
+      return `**${name}**\n` +
+        `· reached 30+ in **${x.reached30}/${x.returnGames}** return games (${pct(x.breakPotentialRate)})\n` +
+        `· reached 40+ in **${x.reached40}/${x.returnGames}** · break pts in **${x.bpGames}**\n` +
+        `· broke **${x.breaks}** of those, taking ${pct(x.conversion)} of live chances\n` +
+        `· held **${x.holds}/${x.serviceGames}** (${pct(x.holdRate)})`;
+    };
+    const parts = [side('A', A), side('B', B)].filter(Boolean);
+    if (parts.length) {
+      /**
+       * The number of games counted is named, because point-by-point does not always
+       * cover every game played — a Challenger match showing 14 games on the scoreline
+       * came back with 12 in the point array. Every rate here therefore carries its own
+       * denominator, and the total is stated, so a partial window reads as a partial
+       * window rather than as the whole match.
+       */
+      const counted = d.A.serviceGames + d.B.serviceGames;
+      em.addFields({
+        name: `Break potential — counted from ${counted} completed game${counted === 1 ? '' : 's'} of point data`,
+        value: parts.join('\n\n').slice(0, 1024)
+      });
+    }
+  }
+
   if (!detail.hasStats) {
-    em.addFields({ name: 'Match statistics', value:
-      `_Not published at ${e.level} level — the API returns an empty statistics ` +
-      `array here even while point-by-point is available. Score, server and the ` +
-      `market above are live; aces and serve percentages are not offered._` });
+    em.addFields({ name: 'Published statistics', value:
+      `_Not available at ${e.level} level — the API returns an empty statistics array ` +
+      `here even though point-by-point is present, so aces and serve percentages are ` +
+      `not offered. The break-potential figures above are counted from the points ` +
+      `directly and are real._` });
   }
 
   em.setFooter({ text: 'api-tennis live' }).setTimestamp(new Date());
@@ -1254,28 +1293,92 @@ function boardMenu(snap, liveOnly) {
 }
 
 /**
- * Keep editing the message while anything is live.
+ * Refresh cadence and the hard ceiling on any refresh loop.
  *
- * Bounded at 14 minutes because an interaction token expires at 15 and every edit
- * after that fails. Stops early once nothing is in progress, so a quiet board is not
- * polled all afternoon. Any edit failure ends the loop rather than retrying into a
- * dead token.
+ * 5 seconds, which is roughly a point. The cost of that is handled in two places
+ * rather than by slowing it down:
+ *
+ *   src/tennisboard.js holds a 4-second shared cache over the two live endpoints, so
+ *   several watchers — and the board loop plus a per-match loop — collapse onto one
+ *   poll instead of multiplying calls.
+ *
+ *   Every loop here compares a signature of what it is about to render against what it
+ *   last rendered and SKIPS the edit when nothing moved. Tennis spends most of its time
+ *   between points, so most ticks change nothing and cost no Discord traffic at all.
+ *   That also keeps well clear of the per-message edit rate limit.
+ *
+ * 14 minutes because a Discord interaction token expires at 15 and every edit after
+ * that fails with an unhelpful 401. There is no way to extend it, so the loop stops and
+ * says so rather than dying silently mid-match.
  */
-const REFRESH_MS = 25000;
+const REFRESH_MS = 5000;
 const REFRESH_LIMIT_MS = 14 * 60 * 1000;
 
-function startBoardRefresh(interaction, opts) {
+/**
+ * A short string that changes exactly when something worth re-rendering changes.
+ *
+ * Scores, the point in play, the server, status and the market. Not the timestamp —
+ * including it would make every tick look different and defeat the whole point.
+ */
+function liveSignature(e, odds) {
+  const o = odds && odds.outright;
+  return [
+    e.status,
+    e.sets.map(([a, b]) => `${a}-${b}`).join(','),
+    e.game || '',
+    e.serving || '',
+    o && o.decimalA != null ? o.decimalA.toFixed(2) : '',
+    o && o.decimalB != null ? o.decimalB.toFixed(2) : ''
+  ].join('|');
+}
+
+function boardSignature(snap) {
+  return snap.live.map(m => `${m.eventKey}:${liveSignature(m, { outright: m.odds })}`).join(';') +
+    `#${snap.live.length}/${snap.upcoming.length}`;
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** One line explaining why a refresh loop ended, appended to the final edit. */
+function stoppedNote(reason) {
+  return {
+    finished: '_Play finished — refresh stopped. Run `/matches` for the current board._',
+    expired: '_Auto-refresh stopped after 14 minutes (Discord token limit). Run the command again._',
+    quiet: '_Nothing live — refresh stopped._'
+  }[reason] || '_Refresh stopped._';
+}
+
+/**
+ * Keep the board embed current while matches are in progress.
+ *
+ * Stops as soon as NOTHING IS LIVE. The previous condition required both the live and
+ * the upcoming list to be empty, and the upcoming list is never empty — 150-odd
+ * matches are always scheduled — so the loop ran the full 14 minutes and kept polling
+ * long after the last ball. It now renders one final frame showing the finished state
+ * and stops there.
+ *
+ * A transient API failure retries on the next tick rather than ending the loop, but an
+ * EDIT failure ends it: that means the message or the token is gone and every
+ * subsequent attempt would fail the same way.
+ */
+function startBoardRefresh(interaction, opts, firstSnap) {
   const until = Date.now() + REFRESH_LIMIT_MS;
+  let lastSig = firstSnap ? boardSignature(firstSnap) : null;
+
+  const render = async (snap, note) => {
+    const menu = boardMenu(snap, opts.liveOnly);
+    await interaction.editReply({
+      content: note || undefined,
+      embeds: [boardEmbed(snap, opts)],
+      components: note ? [] : (menu ? [menu] : [])
+    });
+  };
 
   const tick = async () => {
-    if (Date.now() > until) return;
-    await new Promise(r => setTimeout(r, REFRESH_MS));
+    await sleep(REFRESH_MS);
+
     if (Date.now() > until) {
-      try {
-        await interaction.editReply({
-          content: '_Auto-refresh stopped after 14 minutes. Run `/matches` again._'
-        });
-      } catch (_) { /* token gone; nothing to do */ }
+      try { await interaction.editReply({ content: stoppedNote('expired') }); } catch (_) {}
       return;
     }
 
@@ -1286,21 +1389,78 @@ function startBoardRefresh(interaction, opts) {
         levels: opts.level ? [opts.level] : null
       });
     } catch (_) {
-      return tick();               // transient API problem, try the next tick
+      return tick();                       // transient; try again next tick
     }
+
+    // Play ended. Show the final state once, then stop.
+    if (!snap.live.length) {
+      try { await render(snap, stoppedNote(opts.liveOnly ? 'finished' : 'quiet')); } catch (_) {}
+      return;
+    }
+
+    // Nothing moved between points, which is most ticks. Skip the edit entirely.
+    const sig = boardSignature(snap);
+    if (sig === lastSig) return tick();
+    lastSig = sig;
+
+    try { await render(snap); } catch (_) { return; }
+    return tick();
+  };
+
+  tick().catch(() => {});
+}
+
+/**
+ * Keep ONE picked match's live embed current until it finishes.
+ *
+ * The career comparison above it never changes, so it is captured once and re-sent
+ * unchanged on every edit — editReply replaces the whole message, so the static parts
+ * have to be carried along rather than left behind.
+ *
+ * Ends on the first snapshot where the match is no longer live, after rendering the
+ * final score. That is the condition the board loop was missing.
+ */
+function startMatchRefresh(interaction, eventKey, staticParts, firstDetail) {
+  const until = Date.now() + REFRESH_LIMIT_MS;
+  let lastSig = firstDetail
+    ? liveSignature(firstDetail.entry, firstDetail.odds) : null;
+
+  const tick = async () => {
+    await sleep(REFRESH_MS);
+
+    if (Date.now() > until) {
+      try {
+        await interaction.editReply({
+          content: ((staticParts.content || '') + '\n' + stoppedNote('expired')).slice(0, 2000),
+          embeds: staticParts.embeds
+        });
+      } catch (_) {}
+      return;
+    }
+
+    let detail;
+    try { detail = await board.liveDetail(eventKey); }
+    catch (_) { return tick(); }
+    if (!detail) return tick();
+
+    const over = detail.entry.state !== 'live';
+    const sig = liveSignature(detail.entry, detail.odds);
+
+    // Between points nothing changes; skip the edit unless the match just ended, which
+    // always warrants a final render.
+    if (!over && sig === lastSig) return tick();
+    lastSig = sig;
+
+    const embeds = [...staticParts.embeds, liveDetailEmbed(detail)];
+    const sb = liveStatsBlock(detail);
+    let body = (staticParts.content || '') + (sb ? '\n' + sb : '');
+    if (over) body += '\n' + stoppedNote('finished');
 
     try {
-      const menu = boardMenu(snap, opts.liveOnly);
-      await interaction.editReply({
-        embeds: [boardEmbed(snap, opts)],
-        components: menu ? [menu] : []
-      });
-    } catch (_) {
-      return;                      // message or token gone
-    }
+      await interaction.editReply({ content: body.slice(0, 2000) || undefined, embeds });
+    } catch (_) { return; }
 
-    // Nothing live and nothing about to start: stop rather than idle.
-    if (!snap.live.length && !snap.upcoming.length) return;
+    if (over) return;
     return tick();
   };
 
@@ -1342,7 +1502,7 @@ async function onMatches(i) {
   });
 
   // Only worth refreshing if something is actually in progress.
-  if (snap.live.length) startBoardRefresh(i, opts);
+  if (snap.live.length) startBoardRefresh(i, opts, snap);
   return;
 }
 
@@ -1584,12 +1744,17 @@ async function onPickMatch(i) {
       eventKey ? board.liveDetail(eventKey).catch(() => null) : Promise.resolve(null)
     ]);
 
-    const embeds = [];
-    let content;
+    // The career half never changes, so it is kept separately: a refresh re-sends it
+    // untouched and only swaps the live embed and the live stats table.
+    const staticEmbeds = [];
+    let staticContent = '';
     if (!c.error) {
-      content = comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null);
-      embeds.push(apiEmbed(c));
+      staticContent = comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null);
+      staticEmbeds.push(apiEmbed(c));
     }
+
+    const embeds = [...staticEmbeds];
+    let content = staticContent;
     if (detail) {
       embeds.push(liveDetailEmbed(detail));
       const sb = liveStatsBlock(detail);
@@ -1599,7 +1764,13 @@ async function onPickMatch(i) {
     }
 
     if (!embeds.length) return i.editReply(c.error || 'Nothing to show for that match.');
-    return i.editReply({ content: content || undefined, embeds });
+    await i.editReply({ content: content || undefined, embeds });
+
+    // Only follow a match that is actually being played.
+    if (detail && detail.entry.state === 'live') {
+      startMatchRefresh(i, eventKey, { content: staticContent, embeds: staticEmbeds }, detail);
+    }
+    return;
   }
 
   // Legacy Kalshi-sourced value: "tour|nameA|nameB", names already resolved against

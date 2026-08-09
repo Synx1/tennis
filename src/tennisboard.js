@@ -196,11 +196,55 @@ function boardOrder(a, b) {
 
 const iso = d => new Date(d).toISOString().slice(0, 10);
 
-// Fixtures and pre-match odds change slowly; live data never gets cached.
+// Fixtures and pre-match odds change slowly and are cached for two minutes.
 let fixtureCache = { at: 0, rows: null };
 let oddsCache = { at: 0, map: null };
 const FIXTURE_TTL = 120000;
 const ODDS_TTL = 120000;
+
+/**
+ * Live data gets a very short cache — long enough to be shared, short enough to stay
+ * live.
+ *
+ * At a 5-second refresh a single board costs two calls per tick (livescore plus live
+ * odds), which is 24 a minute; three people watching at once would be 72 for the same
+ * information. A 4-second TTL means concurrent loops and the per-match refresh all
+ * collapse onto one poll, while still being shorter than the refresh interval so no
+ * tick ever renders data it has already shown.
+ *
+ * Deliberately not longer. A cached live score is a wrong live score, and the whole
+ * point of this module is the score being current.
+ */
+const LIVE_TTL = 4000;
+let liveCache = { at: 0, rows: null, inflight: null };
+let liveOddsCache = { at: 0, map: null, inflight: null };
+
+/**
+ * Livescore rows, shared across callers within the TTL.
+ *
+ * `inflight` matters as much as the cache: at a 5-second cadence several loops can ask
+ * within the same few milliseconds, and without it each would open its own request.
+ * They now all await the same promise.
+ */
+async function liveRows({ timezone = 'America/New_York' } = {}) {
+  const now = Date.now();
+  if (liveCache.rows && now - liveCache.at < LIVE_TTL) return liveCache.rows;
+  if (liveCache.inflight) return liveCache.inflight;
+
+  liveCache.inflight = (async () => {
+    try {
+      const r = await api.call('get_livescore', { timezone });
+      const rows = (Array.isArray(r) ? r : []).filter(isSingles);
+      liveCache = { at: Date.now(), rows, inflight: null };
+      return rows;
+    } catch (e) {
+      liveCache.inflight = null;
+      // Serve the last good rows rather than blanking a live board on one failure.
+      return liveCache.rows || [];
+    }
+  })();
+  return liveCache.inflight;
+}
 
 /**
  * One snapshot of the whole board.
@@ -216,14 +260,8 @@ async function snapshot({
 } = {}) {
   const now = Date.now();
 
-  // ── live: never cached ──
-  let liveRows = [];
-  try {
-    const r = await api.call('get_livescore', { timezone });
-    liveRows = (Array.isArray(r) ? r : []).filter(isSingles);
-  } catch (e) {
-    liveRows = [];
-  }
+  // ── live: 4-second shared cache, so concurrent watchers cost one poll ──
+  const liveNow = await liveRows({ timezone });
 
   // ── fixtures: briefly cached ──
   let fxRows = fixtureCache.rows;
@@ -244,7 +282,7 @@ async function snapshot({
   // Livescore wins on conflict: it is the fresher view of the same match.
   const byKey = new Map();
   for (const r of fxRows) byKey.set(String(r.event_key), toEntry(r));
-  for (const r of liveRows) byKey.set(String(r.event_key), toEntry(r));
+  for (const r of liveNow) byKey.set(String(r.event_key), toEntry(r));
 
   let entries = [...byKey.values()];
   if (levels && levels.length) {
@@ -335,10 +373,23 @@ function marketFrom(rows, nameRe) {
  * playing can be read from this endpoint; it is joined on event_key alone.
  */
 async function liveOddsAll() {
+  const now = Date.now();
+  if (liveOddsCache.map && now - liveOddsCache.at < LIVE_TTL) return liveOddsCache.map;
+  if (liveOddsCache.inflight) return liveOddsCache.inflight;
+
+  liveOddsCache.inflight = (async () => {
+    const map = await fetchLiveOdds();
+    liveOddsCache = { at: Date.now(), map, inflight: null };
+    return map;
+  })();
+  return liveOddsCache.inflight;
+}
+
+async function fetchLiveOdds() {
   const out = {};
   let r;
   try { r = await api.call('get_live_odds', { timezone: 'UTC' }); }
-  catch (_) { return out; }
+  catch (_) { return liveOddsCache.map || out; }
 
   for (const [k, m] of Object.entries(r || {})) {
     const rows = m.live_odds || [];
@@ -455,6 +506,98 @@ function readPointByPoint(pbp, { servingSide } = {}) {
   };
 }
 
+/** Rank a point value so "did they reach 30" is a comparison. */
+function pointRank(token) {
+  const t = String(token || '').trim().toUpperCase();
+  if (t === 'A' || t === 'AD') return 4;      // advantage
+  if (t === '40') return 3;
+  if (t === '30') return 2;
+  if (t === '15') return 1;
+  if (t === '0' || t === '') return 0;
+  const n = Number(t);                        // tiebreaks count numerically
+  return isFinite(n) ? Math.min(4, n) : 0;
+}
+
+/**
+ * Break potential and return pressure, derived from the point sequence.
+ *
+ * ── why derive it ──
+ *
+ * ITF matches return an EMPTY `statistics` array while `pointbypoint` is fully
+ * populated — 25 games on the W15 Tianjin final with no stats at all. So at the level
+ * that makes up most of the board, points are the ONLY source for anything below the
+ * scoreline. Everything here is computed from them.
+ *
+ * ── what break potential means ──
+ *
+ * A return game where the returner reached 30 or 40 is a game where the break was
+ * live, whether or not a break point was ever formally reached. Counted once per game,
+ * so a long deuce game does not outweigh a routine one. This mirrors the definition
+ * already used for charted historical data in src/tenniscore.js, which keeps the live
+ * figure and the career figure comparable.
+ *
+ * Break POINTS are counted separately, from the API's own `break_point` flag, because
+ * "reached 40" and "held a break point" are not the same thing — 40-40 is not a break
+ * point, and the flag knows that.
+ *
+ * Point scores read "<first player> - <second player>", matching score_first/second, so
+ * the returner's side is chosen by which player served.
+ */
+function derivePointStats(games) {
+  const blank = () => ({
+    returnGames: 0, reached30: 0, reached40: 0, bpGames: 0, breaks: 0,
+    serviceGames: 0, holds: 0, deuceGames: 0, pointsWon: 0
+  });
+  const out = { A: blank(), B: blank() };
+
+  for (const g of games) {
+    if (!g.servedBy) continue;
+    const server = g.servedBy;
+    const returner = server === 'A' ? 'B' : 'A';
+    const decided = g.after != null && g.wonBy;
+
+    if (decided) {
+      out[server].serviceGames++;
+      out[returner].returnGames++;
+      if (g.wonBy === server) out[server].holds++;
+      else out[returner].breaks++;
+    }
+
+    // How far the returner got, and whether a break point ever existed.
+    let best = 0, sawBP = false, sawDeuce = false;
+    for (const p of g.points) {
+      const parts = String(p.score || '').split('-');
+      if (parts.length !== 2) continue;
+      const a = pointRank(parts[0]), b = pointRank(parts[1]);
+      const mine = returner === 'A' ? a : b;
+      if (mine > best) best = mine;
+      if (a >= 3 && b >= 3) sawDeuce = true;
+      if (p.bp) sawBP = true;
+    }
+
+    // Only completed games count toward rates, so an in-progress game cannot inflate
+    // a denominator that its own outcome has not yet joined.
+    if (decided) {
+      if (best >= 2) out[returner].reached30++;
+      if (best >= 3) out[returner].reached40++;
+      if (sawBP) out[returner].bpGames++;
+      if (sawDeuce) { out.A.deuceGames++; out.B.deuceGames++; }
+    }
+  }
+
+  for (const side of ['A', 'B']) {
+    const s = out[side];
+    s.breakPotentialRate = s.returnGames ? s.reached30 / s.returnGames : null;
+    s.reached40Rate = s.returnGames ? s.reached40 / s.returnGames : null;
+    s.bpGameRate = s.returnGames ? s.bpGames / s.returnGames : null;
+    s.holdRate = s.serviceGames ? s.holds / s.serviceGames : null;
+    s.breakRate = s.returnGames ? s.breaks / s.returnGames : null;
+    // Of the games where the break was live, how many were actually taken.
+    s.conversion = s.reached30 ? s.breaks / s.reached30 : null;
+  }
+  return out;
+}
+
 /**
  * Everything known about one live match, in one object.
  *
@@ -466,10 +609,9 @@ async function liveDetail(eventKey, { timezone = 'America/New_York' } = {}) {
   const want = String(eventKey);
   let row = null;
 
-  try {
-    const rows = await api.call('get_livescore', { timezone });
-    row = (Array.isArray(rows) ? rows : []).find(r => String(r.event_key) === want) || null;
-  } catch (_) { /* fall through */ }
+  // Shared cache: a per-match refresh and the board refresh both land on one poll.
+  const rows = await liveRows({ timezone });
+  row = rows.find(r => String(r.event_key) === want) || null;
 
   if (!row) {
     try {
@@ -482,13 +624,21 @@ async function liveDetail(eventKey, { timezone = 'America/New_York' } = {}) {
   const entry = toEntry(row);
   const stats = indexStats(row.statistics, row.first_player_key, row.second_player_key);
   const pbp = readPointByPoint(row.pointbypoint, { servingSide: entry.serving });
+  const derived = derivePointStats(pbp.games);
   const odds = await liveOddsFor(want);
 
-  return { entry, stats, pbp, odds, hasStats: !!(stats.match && stats.match.size) };
+  return {
+    entry, stats, pbp, derived, odds,
+    hasStats: !!(stats.match && stats.match.size),
+    // Points are present at every level, statistics are not, so a caller can always
+    // show the derived block and only sometimes the published one.
+    hasPoints: pbp.games.length > 0
+  };
 }
 
 module.exports = {
-  snapshot, liveOddsAll, liveOddsFor, liveDetail, indexStats, readPointByPoint,
-  marketFrom, toEntry, stateOf, levelOf, setsOf, roundOf, priceFromHomeAway,
-  boardOrder, isSingles, LEVELS
+  snapshot, liveOddsAll, liveOddsFor, liveDetail, liveRows, indexStats,
+  readPointByPoint, derivePointStats, pointRank, marketFrom, toEntry, stateOf,
+  levelOf, setsOf, roundOf, priceFromHomeAway, boardOrder, isSingles,
+  LEVELS, LIVE_TTL
 };
