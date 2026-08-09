@@ -47,10 +47,22 @@ Discord bot for tennis match analysis, statistics, and live match tracking.
 npm install
 ```
 
-2. Set environment variable:
+2. Configure bot token:
+
+**Option A: Environment variable (recommended for production)**
 ```bash
-export TENNIS_BOT_TOKEN=your_discord_token
+export TENNIS_BOT_TOKEN=your_discord_bot_token
+npm start
 ```
+
+**Option B: .env file (recommended for development)**
+```bash
+cp .env.example .env
+# Edit .env and add your token
+npm start
+```
+
+The bot will check `TENNIS_BOT_TOKEN` first, then fall back to `DISCORD_TOKEN` if you're using a shared token across multiple bots.
 
 3. Run the bot:
 ```bash

@@ -30,6 +30,13 @@
  *   node tennis-bot.js
  */
 
+// Load .env if present
+require('fs').existsSync('.env') && require('fs').readFileSync('.env', 'utf8')
+  .split(/\r?\n/).forEach(line => {
+    const m = line.trim().match(/^([^#=]+)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
+  });
+
 const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes,
         SlashCommandBuilder, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const data = require('./src/tennisdata');
@@ -41,19 +48,22 @@ const core = require('./src/tenniscore');
 /**
  * Token for THIS application.
  *
- * Carried as a constant for the same reason the crypto bot's is: the deploy target
- * has no .env, and a bot that cannot start without one configured is a bot that does
- * not start. An environment variable still overrides it.
+ * Reads from environment variable TENNIS_BOT_TOKEN. If not set, falls back to checking
+ * DISCORD_TOKEN (for shared deployments), then finally errors with instructions.
  *
- * Synx1/BOT is private, which is the only thing making this acceptable. If that ever
- * changes, rotate this before flipping the switch — GitHub reports leaked tokens to
- * Discord and Discord invalidates them.
+ * Set via:
+ *   export TENNIS_BOT_TOKEN=your_token_here
+ * or create a .env file:
+ *   TENNIS_BOT_TOKEN=your_token_here
  */
-const TOKEN = (process.env.TENNIS_BOT_TOKEN || '')
+const TOKEN = (process.env.TENNIS_BOT_TOKEN || process.env.DISCORD_TOKEN || '')
   .trim().replace(/^Bot\s+/i, '');
 
-if (!TOKEN) {
-  console.error('Error: TENNIS_BOT_TOKEN environment variable not set');
+if (!TOKEN || TOKEN.split('.').length !== 3) {
+  console.error('[tennis] TENNIS_BOT_TOKEN or DISCORD_TOKEN environment variable not set');
+  console.error('[tennis] Create a .env file with:');
+  console.error('[tennis]   TENNIS_BOT_TOKEN=your_discord_bot_token_here');
+  console.error('[tennis] Or set the environment variable before running');
   process.exit(1);
 }
 
@@ -803,10 +813,6 @@ client.on('interactionCreate', async i => {
 client.on('error', e => line(`[tennis] client error: ${e.message}`));
 process.on('unhandledRejection', e => line(`[tennis] unhandled: ${e?.message || e}`));
 
-if (!TOKEN || TOKEN.split('.').length !== 3) {
-  line('[tennis] TENNIS_BOT_TOKEN is missing or malformed');
-  process.exit(1);
-}
 client.login(TOKEN).catch(e => {
   line(`[tennis] login failed: ${e.message}`);
   process.exit(1);
