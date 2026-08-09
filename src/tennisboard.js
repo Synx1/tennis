@@ -372,7 +372,123 @@ async function liveOddsFor(eventKey) {
   return all[String(eventKey)] || null;
 }
 
+// ── live match detail ───────────────────────────────
+
+/**
+ * The statistics array, indexed by period then by stat name.
+ *
+ * Rows look like { player_key, stat_period, stat_type, stat_name, stat_value,
+ * stat_won, stat_total }, one per player per stat per period. Measured on a live
+ * Challenger match: 98 rows across periods match/set1/set2 and types
+ * Service/Return/Points/Games, giving 17 distinct names including aces, double
+ * faults, first-serve percentage, break points saved and converted, and points won.
+ *
+ * ITF matches return an EMPTY array even while point-by-point is populated, so every
+ * caller has to treat this as optional rather than assume it is there.
+ */
+function indexStats(rows, keyA, keyB) {
+  const out = {};
+  for (const s of (rows || [])) {
+    const period = String(s.stat_period || 'match');
+    const name = String(s.stat_name || '').trim();
+    if (!name) continue;
+    out[period] = out[period] || new Map();
+    if (!out[period].has(name)) out[period].set(name, { name, type: s.stat_type, A: null, B: null });
+
+    const side = String(s.player_key) === String(keyA) ? 'A'
+      : String(s.player_key) === String(keyB) ? 'B' : null;
+    if (!side) continue;
+
+    out[period].get(name)[side] = {
+      value: s.stat_value,
+      won: s.stat_won == null ? null : Number(s.stat_won),
+      total: s.stat_total == null ? null : Number(s.stat_total)
+    };
+  }
+  return out;
+}
+
+/**
+ * The game currently being played, and the games just finished.
+ *
+ * The in-progress game is identifiable because its `score` and `serve_winner` are
+ * still null while its `points` array grows. Advantage arrives as "A - 40" in the
+ * point score, which is why the raw string is passed through rather than parsed into
+ * numbers.
+ */
+function readPointByPoint(pbp, { servingSide } = {}) {
+  const games = (pbp || []).map(g => ({
+    set: String(g.set_number || '').trim(),
+    game: Number(g.number_game),
+    servedBy: /first/i.test(String(g.player_served || '')) ? 'A'
+      : /second/i.test(String(g.player_served || '')) ? 'B' : null,
+    wonBy: /first/i.test(String(g.serve_winner || '')) ? 'A'
+      : /second/i.test(String(g.serve_winner || '')) ? 'B' : null,
+    after: g.score == null ? null : String(g.score),
+    points: (g.points || []).map(p => ({
+      score: String(p.score || ''),
+      bp: !!p.break_point, sp: !!p.set_point, mp: !!p.match_point
+    }))
+  }));
+
+  const inProgress = games.length && games[games.length - 1].after == null
+    ? games[games.length - 1] : null;
+
+  // A break is the server losing their own service game.
+  const finished = games.filter(g => g.after != null && g.wonBy && g.servedBy);
+  const recent = finished.slice(-6).map(g => ({
+    ...g, broken: g.wonBy !== g.servedBy
+  }));
+
+  const cur = inProgress || (finished.length ? finished[finished.length - 1] : null);
+  const lastPoint = cur && cur.points.length ? cur.points[cur.points.length - 1] : null;
+
+  return {
+    games, inProgress, recent, lastPoint,
+    // Flags on the CURRENT point, which is what a viewer wants shouted at them.
+    flags: lastPoint ? { bp: lastPoint.bp, sp: lastPoint.sp, mp: lastPoint.mp } : null,
+    breaks: {
+      A: finished.filter(g => g.servedBy === 'B' && g.wonBy === 'A').length,
+      B: finished.filter(g => g.servedBy === 'A' && g.wonBy === 'B').length
+    },
+    servingSide: servingSide || (inProgress ? inProgress.servedBy : null)
+  };
+}
+
+/**
+ * Everything known about one live match, in one object.
+ *
+ * Sourced from get_livescore rather than get_fixtures because only livescore is
+ * refreshed continuously; fixtures is a schedule that happens to carry a score.
+ * Falls back to fixtures so a match that has just finished still renders.
+ */
+async function liveDetail(eventKey, { timezone = 'America/New_York' } = {}) {
+  const want = String(eventKey);
+  let row = null;
+
+  try {
+    const rows = await api.call('get_livescore', { timezone });
+    row = (Array.isArray(rows) ? rows : []).find(r => String(r.event_key) === want) || null;
+  } catch (_) { /* fall through */ }
+
+  if (!row) {
+    try {
+      const rows = await api.call('get_fixtures', { match_key: want, timezone });
+      row = (Array.isArray(rows) ? rows : [])[0] || null;
+    } catch (_) { /* nothing else to try */ }
+  }
+  if (!row) return null;
+
+  const entry = toEntry(row);
+  const stats = indexStats(row.statistics, row.first_player_key, row.second_player_key);
+  const pbp = readPointByPoint(row.pointbypoint, { servingSide: entry.serving });
+  const odds = await liveOddsFor(want);
+
+  return { entry, stats, pbp, odds, hasStats: !!(stats.match && stats.match.size) };
+}
+
 module.exports = {
-  snapshot, liveOddsAll, liveOddsFor, marketFrom, toEntry, stateOf, levelOf,
-  setsOf, roundOf, priceFromHomeAway, boardOrder, isSingles, LEVELS
+  snapshot, liveOddsAll, liveOddsFor, liveDetail, indexStats, readPointByPoint,
+  marketFrom, toEntry, stateOf, levelOf, setsOf, roundOf, priceFromHomeAway,
+  boardOrder, isSingles, LEVELS
 };

@@ -240,97 +240,313 @@ const padVisible = (s, w) => {
 function pointBlock(nameA, nameB, pa, pb) {
   if (!pa && !pb) return null;
 
-  const W = 17, M = 36;
+  // Same 38-column, label-first layout as comparisonBlock, for the same reason.
+  const L = 18, V = 10;
   const out = [];
-  const pct1 = v => v == null ? '—' : `${(v * 100).toFixed(0)}%`;
-  const n1 = v => v == null ? '—' : v.toFixed(1);
-  const withN = (r) => r == null || r.pct == null ? '—'
-    : `${(r.pct * 100).toFixed(0)}% (${r.n})${r.n < 10 ? '*' : ''}`;
+  const pct1 = v => v == null ? '—' : `${Math.round(v * 100)}%`;
+  const n1 = v => v == null ? '—' : Number(v).toFixed(1);
+  const withN = r => (r == null || r.pct == null) ? '—'
+    : `${Math.round(r.pct * 100)}%(${r.n})${r.n < 10 ? '*' : ''}`;
 
   const row = (label, va, vb, fmt, higherIsBetter = true) => {
     const na = va == null ? null : Number(va.pct != null ? va.pct : va);
     const nb = vb == null ? null : Number(vb.pct != null ? vb.pct : vb);
-    let aWin = false, bWin = false;
+    let aw = false, bw = false;
     if (na != null && nb != null && na !== nb) {
       const aBigger = na > nb;
-      aWin = higherIsBetter ? aBigger : !aBigger;
-      bWin = !aWin;
+      aw = higherIsBetter ? aBigger : !aBigger;
+      bw = !aw;
     }
-    const fa = fmt(va), fb = fmt(vb);
+    const fa = fmt(va) + (aw ? '^' : ''), fb = fmt(vb) + (bw ? '^' : '');
     out.push(
-      padVisible(aWin ? `${ANSI.green}${fa}${ANSI.reset}` : fa, W) +
-      padVisible(label, M) +
-      (bWin ? `${ANSI.green}${fb}${ANSI.reset}` : fb)
+      label.padEnd(L) +
+      padVisible(aw ? `${ANSI.green}${fa}${ANSI.reset}` : fa, V) +
+      (bw ? `${ANSI.green}${fb}${ANSI.reset}` : fb)
     );
   };
 
-  out.push(`${ANSI.bold}${padVisible('POINT-LEVEL', W)}` +
-    `${padVisible('(charted matches only)', M)}${ANSI.reset}`);
-  out.push('─'.repeat(W + M + W));
-
-  row('Win % when opp hit MORE aces', pa?.winWhenOppMoreAces, pb?.winWhenOppMoreAces, withN);
-  row('Win % when opp hit FEWER aces', pa?.winWhenOppFewerAces, pb?.winWhenOppFewerAces, withN);
-  row('Aces per match', pa?.avgAces, pb?.avgAces, n1);
-  out.push('─'.repeat(W + M + W));
-  row('Break potential per match', pa?.breakPotentialPerMatch, pb?.breakPotentialPerMatch, n1);
-  row('Break potential per rtn game', pa?.breakPotentialRate, pb?.breakPotentialRate, pct1);
+  out.push(`${ANSI.bold}POINT-LEVEL (charted only)${ANSI.reset}`);
+  out.push('─'.repeat(L + V + V));
+  row('Win, opp MORE aces', pa?.winWhenOppMoreAces, pb?.winWhenOppMoreAces, withN);
+  row('Win, opp FEWER aces', pa?.winWhenOppFewerAces, pb?.winWhenOppFewerAces, withN);
+  row('Aces / match', pa?.avgAces, pb?.avgAces, n1);
+  out.push('─'.repeat(L + V + V));
+  row('Break pot / match', pa?.breakPotentialPerMatch, pb?.breakPotentialPerMatch, n1);
+  row('Break pot / rtn gm', pa?.breakPotentialRate, pb?.breakPotentialRate, pct1);
   // Lower is better: this is what they allow on their OWN serve.
-  row('Conceded per match (lower=better)', pa?.concededPerMatch, pb?.concededPerMatch, n1, false);
-  row('Conceded per svc game', pa?.concededRate, pb?.concededRate, pct1, false);
-
-  out.push('─'.repeat(W + M + W));
-  out.push(padVisible(String(pa ? pa.breakPotentialMatches : '—'), W) +
-    padVisible('Charted matches w/ point data', M) +
+  row('Conceded / match', pa?.concededPerMatch, pb?.concededPerMatch, n1, false);
+  row('Conceded / svc gm', pa?.concededRate, pb?.concededRate, pct1, false);
+  out.push('─'.repeat(L + V + V));
+  out.push('Charted matches'.padEnd(L) +
+    String(pa ? pa.breakPotentialMatches : '—').padEnd(V) +
     String(pb ? pb.breakPotentialMatches : '—'));
 
   return '```ansi\n' + out.join('\n') + '\n```';
 }
 
+// ── live match detail embed ─────────────────────────────────────
+
+/**
+ * Point score with advantage spelled out.
+ *
+ * api-tennis writes advantage as "A" in the point score, so "A - 40" is the server
+ * holding advantage. Left as-is rather than converted to "AD" because that is what
+ * the source says and inventing a different notation for the same thing invites a
+ * mismatch when the raw value is also shown.
+ */
+function fmtPoints(game) {
+  if (!game) return null;
+  const s = String(game).trim();
+  return (!s || s === '-') ? null : s.replace(/\s+/g, ' ');
+}
+
+/** The one-line score summary: sets, then the game in progress. */
+function fmtLiveScoreLine(e) {
+  const sets = e.sets.map(([a, b]) => `${a}-${b}`).join('  ');
+  const pts = fmtPoints(e.game);
+  return `\`${sets || '—'}\`${pts ? `   pts \`${pts}\`` : ''}`;
+}
+
+/**
+ * The live statistics table, when the level publishes any.
+ *
+ * ITF returns an empty statistics array even with point-by-point populated, so this
+ * returns null there rather than rendering an empty frame. Challenger and above gave
+ * 17 match-period stats across Service, Return, Points and Games.
+ *
+ * Double faults are the one row where LOWER is better, so the marker is inverted.
+ */
+const LIVE_STAT_ROWS = [
+  ['Aces', 'Aces', true],
+  ['Double faults', 'Double Faults', false],
+  ['1st serve in', '1st serve percentage', true],
+  ['1st serve won', '1st serve points won', true],
+  ['2nd serve won', '2nd serve points won', true],
+  ['BP saved', 'Break Points Saved', true],
+  ['BP converted', 'Break Points Converted', true],
+  ['Service pts won', 'Service Points Won', true],
+  ['Return pts won', 'Return Points Won', true],
+  ['Total pts won', 'Total Points Won', true],
+  ['Service games', 'Service games won', true],
+  ['Last 10 balls', 'Last 10 balls', true]
+];
+
+function liveStatsBlock(detail) {
+  const m = detail.stats && detail.stats.match;
+  if (!m || !m.size) return null;
+
+  const L = 18, V = 10;
+  const out = [];
+  out.push(`${ANSI.bold}${'MATCH STATS'.padEnd(L)}${'A'.padEnd(V)}B${ANSI.reset}`);
+  out.push('─'.repeat(L + V + V));
+
+  const numOf = v => {
+    if (!v || v.value == null) return null;
+    const n = parseFloat(String(v.value).replace('%', ''));
+    return isFinite(n) ? n : null;
+  };
+
+  let rendered = 0;
+  for (const [label, name, higherBetter] of LIVE_STAT_ROWS) {
+    const row = m.get(name);
+    if (!row || (!row.A && !row.B)) continue;
+    rendered++;
+
+    const na = numOf(row.A), nb = numOf(row.B);
+    let aw = false, bw = false;
+    if (na != null && nb != null && na !== nb) {
+      const aBigger = na > nb;
+      aw = higherBetter ? aBigger : !aBigger;
+      bw = !aw;
+    }
+    const show = v => v && v.value != null ? String(v.value) : '—';
+    const ca = show(row.A) + (aw ? '^' : ''), cb = show(row.B) + (bw ? '^' : '');
+    out.push(
+      label.padEnd(L) +
+      padVisible(aw ? `${ANSI.green}${ca}${ANSI.reset}` : ca, V) +
+      (bw ? `${ANSI.green}${cb}${ANSI.reset}` : cb)
+    );
+  }
+  if (!rendered) return null;
+
+  out.push('');
+  out.push('^ = better this match');
+  return '```ansi\n' + out.join('\n') + '\n```';
+}
+
+/**
+ * The live embed that sits under the comparison.
+ *
+ * Deliberately a SECOND embed rather than more fields on the first: one describes
+ * career form and does not change, the other is the current state of a match and is
+ * rewritten every refresh. Merging them would mean re-sending static content on every
+ * tick and make it unclear which numbers are live.
+ */
+function liveDetailEmbed(detail) {
+  const e = detail.entry;
+  const A = e.playerA, B = e.playerB;
+  const serving = s => e.serving === s ? '🎾 ' : '';
+  const lead = s => (s === 'A' ? e.setsWonA > e.setsWonB : e.setsWonB > e.setsWonA);
+
+  const em = new EmbedBuilder()
+    .setColor(e.state === 'live' ? 0xed4245 : 0x2b2d31)
+    .setTitle(e.state === 'live' ? `🔴 LIVE · ${e.status}` : `${e.status || 'Not started'}`)
+    .setDescription(
+      `**${e.level}** · ${e.tournament}${e.round ? ' · ' + e.round : ''}` +
+      (e.qualifying ? ' _(qualifying)_' : '') + '\n\n' +
+      `${serving('A')}${lead('A') ? `**${A}**` : A}\n` +
+      `${serving('B')}${lead('B') ? `**${B}**` : B}\n\n` +
+      fmtLiveScoreLine(e) +
+      (e.serving ? `\n🎾 ${e.serving === 'A' ? A : B} serving` : '')
+    );
+
+  // Break point / set point / match point on the current point.
+  const flags = detail.pbp && detail.pbp.flags;
+  if (flags && (flags.bp || flags.sp || flags.mp)) {
+    const which = [flags.mp && 'MATCH POINT', flags.sp && 'SET POINT', flags.bp && 'BREAK POINT']
+      .filter(Boolean);
+    em.addFields({ name: '⚠️ ' + which.join(' · '), value: '\u200b' });
+  }
+
+  // Breaks of serve so far, which the scoreline alone does not show.
+  if (detail.pbp && (detail.pbp.breaks.A || detail.pbp.breaks.B)) {
+    em.addFields({
+      name: 'Breaks of serve',
+      value: `${A} **${detail.pbp.breaks.A}** · ${B} **${detail.pbp.breaks.B}**`,
+      inline: true
+    });
+  }
+
+  // Live market.
+  if (detail.odds) {
+    const o = detail.odds.outright;
+    const pc = p => p == null ? '—' : `${Math.round(p * 100)}%`;
+    const bits = [];
+    if (o && o.decimalA) {
+      bits.push(`**${o.decimalA.toFixed(2)}** / **${o.decimalB.toFixed(2)}**  (${pc(o.pA)} / ${pc(o.pB)})`);
+    }
+    const sw = detail.odds.setWinner;
+    if (sw && sw.pA != null) bits.push(`set ${detail.odds.setNo}: ${pc(sw.pA)} / ${pc(sw.pB)}`);
+    const gw = detail.odds.gameWinner;
+    if (gw && gw.pA != null) bits.push(`this game: ${pc(gw.pA)} / ${pc(gw.pB)}`);
+    if (detail.odds.goesToDecider && isFinite(detail.odds.goesToDecider.value)) {
+      bits.push(`goes to a decider: ${detail.odds.goesToDecider.value.toFixed(2)}`);
+    }
+    if (o && o.suspended) bits.push('_betting suspended_');
+    if (bits.length) em.addFields({ name: 'Live market', value: bits.join('\n') });
+  }
+
+  /**
+   * Recent games, newest last, so a run of holds or a break is visible.
+   *
+   * The SET is labelled because `after` restarts each set: a tail spanning a set
+   * boundary otherwise reads "4-2" then "4-1" and looks like the score went
+   * backwards. Newest first would be worse — a game sequence is read forwards.
+   */
+  if (detail.pbp && detail.pbp.recent.length) {
+    const setNum = s => {
+      const m = String(s || '').match(/(\d+)/);
+      return m ? `S${m[1]}` : '--';
+    };
+    const lines = detail.pbp.recent.slice(-5).map(g => {
+      const who = g.servedBy === 'A' ? A : B;
+      return `\`${setNum(g.set)} ${String(g.after || '').padEnd(5)}\` ` +
+        `${g.broken ? '**BREAK**' : 'held'} · ${who}`;
+    });
+    em.addFields({ name: 'Recent games (oldest first)', value: lines.join('\n').slice(0, 1024) });
+  }
+
+  if (!detail.hasStats) {
+    em.addFields({ name: 'Match statistics', value:
+      `_Not published at ${e.level} level — the API returns an empty statistics ` +
+      `array here even while point-by-point is available. Score, server and the ` +
+      `market above are live; aces and serve percentages are not offered._` });
+  }
+
+  em.setFooter({ text: 'api-tennis live' }).setTimestamp(new Date());
+  return em;
+}
+
+/**
+ * The comparison table, sized for a phone.
+ *
+ * ── why it was rebuilt ──
+ *
+ * The previous layout was 17 + 36 + 17 = 70 monospace columns with the label in the
+ * MIDDLE and a value either side. On a phone that is far past the width of a code
+ * block, so every row soft-wrapped and the two value columns interleaved with the
+ * labels — the table did not just look cramped, it became unreadable. And the green
+ * highlight was ANSI, which did not render, so the one cue for "who is better" was
+ * gone precisely where the layout needed it most.
+ *
+ * This version is 38 columns: label first, then both values, which is the ordering
+ * that survives a wrap because a wrapped line breaks AFTER the data rather than
+ * between the two numbers. The better value is marked with a caret, so the meaning
+ * survives with no colour at all, and ANSI green is layered on top for clients that
+ * do render it.
+ *
+ * Labels are abbreviated rather than truncated: "S3 after S2 won" is readable at a
+ * glance, "Set 3 after winning set 2 · car…" is not.
+ */
 function comparisonBlock(nameA, nameB, a, b, surface) {
   const ROWS = [
     ['Last 10', 'lastTen'],
-    ['Win after winning set 1', 'winAfterSet1Won'],
-    ['Win after losing set 1', 'winAfterSet1Lost'],
+    ['Win % career', 'winCareer'],
+    ['Win % this yr', 'winYear'],
     ['Set 1 win %', 'set1'],
     ['Set 2 win %', 'set2'],
     ['Set 3 win %', 'set3'],
-    ['Set 2 after winning set 1', 'set2AfterSet1Won'],
-    ['Set 2 after losing set 1', 'set2AfterSet1Lost'],
-    ['Set 3 after winning set 2 · yr', 'set3AfterSet2WonYear'],
-    ['Set 3 after winning set 2 · career', 'set3AfterSet2WonCareer'],
-    ['Set 3 after losing set 2 · yr', 'set3AfterSet2LostYear'],
-    ['Set 3 after losing set 2 · career', 'set3AfterSet2LostCareer'],
-    ['Win % this year', 'winYear'],
-    ['Win % career', 'winCareer']
+    ['Win if won S1', 'winAfterSet1Won'],
+    ['Win if lost S1', 'winAfterSet1Lost'],
+    ['S2 if won S1', 'set2AfterSet1Won'],
+    ['S2 if lost S1', 'set2AfterSet1Lost'],
+    ['S3 if won S2 yr', 'set3AfterSet2WonYear'],
+    ['S3 if won S2 car', 'set3AfterSet2WonCareer'],
+    ['S3 if lost S2 yr', 'set3AfterSet2LostYear'],
+    ['S3 if lost S2 car', 'set3AfterSet2LostCareer']
   ];
-  if (surface) ROWS.push([`Surface (${surface}) · career`, 'surfaceCareer']);
+  if (surface) ROWS.push([`${surface} career`, 'surfaceCareer']);
 
-  const W = 17, M = 36;
+  const L = 18, V = 10;
   const out = [];
-  out.push(`${ANSI.bold}${padVisible(shortName(nameA), W)}${padVisible('', 2)}` +
-    `${padVisible('', M - 2)}${shortName(nameB)}${ANSI.reset}`);
-  out.push('─'.repeat(W + M + W));
+
+  // Names go in the header, abbreviated hard so two fit in 20 columns.
+  const tiny = n => {
+    const s = String(n).trim();
+    return s.length <= 9 ? s : s.slice(0, 8) + '.';
+  };
+  out.push(`${ANSI.bold}${'STAT'.padEnd(L)}${tiny(nameA).padEnd(V)}${tiny(nameB)}${ANSI.reset}`);
+  out.push('─'.repeat(L + V + V));
+
+  /** "60%(10)^" — the caret is the colour-free marker for the better side. */
+  const cell = (r, better) => {
+    if (!r || r.pct == null || r.n === 0) return '—';
+    const body = `${Math.round(r.pct * 100)}%(${r.n})${r.reliable ? '' : '*'}`;
+    return better ? `${body}^` : body;
+  };
 
   for (const [label, key] of ROWS) {
     const ra = a[key], rb = b[key];
     const pa = ra && ra.pct, pb = rb && rb.pct;
-    const aWins = pa != null && pb != null && pa > pb;
-    const bWins = pa != null && pb != null && pb > pa;
+    const aw = pa != null && pb != null && pa > pb;
+    const bw = pa != null && pb != null && pb > pa;
+    const ca = cell(ra, aw), cb = cell(rb, bw);
     out.push(
-      padVisible(fmtRate(ra, { highlight: aWins }), W) +
-      padVisible(label, M) +
-      fmtRate(rb, { highlight: bWins })
+      label.padEnd(L) +
+      padVisible(aw ? `${ANSI.green}${ca}${ANSI.reset}` : ca, V) +
+      (bw ? `${ANSI.green}${cb}${ANSI.reset}` : cb)
     );
   }
 
-  // Streaks are not rates, so they sit below the table rather than inside it.
+  // Streaks are not rates, so they sit below rather than inside the table.
   const stk = s => s.streak.type ? `${s.streak.type}${s.streak.n}` : '—';
   const s3 = s => s.set3Streak.type ? `${s.set3Streak.type}${s.set3Streak.n}` : '—';
-  out.push('─'.repeat(W + M + W));
-  out.push(padVisible(stk(a), W) + padVisible('Current run', M) + stk(b));
-  out.push(padVisible(s3(a), W) + padVisible('Set-3 run', M) + s3(b));
-  out.push(padVisible(String(a.decidersPlayed), W) +
-    padVisible('Deciders played', M) + String(b.decidersPlayed));
+  out.push('─'.repeat(L + V + V));
+  out.push('Current run'.padEnd(L) + String(stk(a)).padEnd(V) + stk(b));
+  out.push('Set-3 run'.padEnd(L) + String(s3(a)).padEnd(V) + s3(b));
+  out.push('Deciders'.padEnd(L) + String(a.decidersPlayed).padEnd(V) + String(b.decidersPlayed));
+  out.push('');
+  out.push('^ = better  * = under 10, unreliable');
 
   return '```ansi\n' + out.join('\n') + '\n```';
 }
@@ -1017,8 +1233,9 @@ function boardMenu(snap, liveOnly) {
       .addOptions(pool.map(m => {
         // Player KEYS, not names. api-tennis gives them on every row, so the pick
         // needs no surname reconstruction and cannot resolve to the wrong person.
+        // The EVENT key rides along so the pick can also pull live match state.
         const tour = /women|wta|girls/i.test(m.eventType) ? 'wta' : 'atp';
-        const value = `k|${tour}|${m.keyA}|${m.keyB}`.slice(0, 100);
+        const value = `k|${tour}|${m.keyA}|${m.keyB}|${m.eventKey}`.slice(0, 100);
         const bits = [m.level];
         if (m.state === 'live') {
           const s = fmtSets(m).replace(/__/g, '');
@@ -1356,14 +1573,33 @@ async function onPickMatch(i) {
    * name and re-resolving it; here there is nothing to rebuild.
    */
   if (value.startsWith('k|')) {
-    const [, tourRaw, keyA, keyB] = value.split('|');
+    const [, tourRaw, keyA, keyB, eventKey] = value.split('|');
     const tour = tourRaw === 'wta' ? 'wta' : 'atp';
-    const c = await apiComparisonByKey(tour, keyA, keyB);
-    if (c.error) return i.editReply(c.error);
-    return i.editReply({
-      content: comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null),
-      embeds: [apiEmbed(c)]
-    });
+
+    // Career comparison and live state are independent: a live match with no history
+    // should still show its score, and a scheduled match with history should still
+    // compare. So they are fetched together and rendered from whatever came back.
+    const [c, detail] = await Promise.all([
+      apiComparisonByKey(tour, keyA, keyB),
+      eventKey ? board.liveDetail(eventKey).catch(() => null) : Promise.resolve(null)
+    ]);
+
+    const embeds = [];
+    let content;
+    if (!c.error) {
+      content = comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null);
+      embeds.push(apiEmbed(c));
+    }
+    if (detail) {
+      embeds.push(liveDetailEmbed(detail));
+      const sb = liveStatsBlock(detail);
+      // The stats table goes in the message body, not the embed: a code block inside
+      // an embed field is capped at 1024 characters and this table can exceed it.
+      if (sb) content = (content ? content + '\n' : '') + sb;
+    }
+
+    if (!embeds.length) return i.editReply(c.error || 'Nothing to show for that match.');
+    return i.editReply({ content: content || undefined, embeds });
   }
 
   // Legacy Kalshi-sourced value: "tour|nameA|nameB", names already resolved against
