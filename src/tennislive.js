@@ -59,6 +59,23 @@ function surnameKeys(name) {
 }
 
 /**
+ * Tournament name from a market title.
+ * 
+ * Titles like "Will Jannik Sinner win the Sinner vs Alcaraz: Round Of 16 match?"
+ * The "win the X" portion before the colon often contains match info but not a clear
+ * tournament. The event_ticker (e.g. KXATPMATCH-2026-08-09-R16-USOPEN) is more reliable.
+ */
+function tournamentFromTicker(ticker) {
+  // Extract tournament from ticker like "KXATPMATCH-2026-08-09-R16-USOPEN"
+  const parts = String(ticker || '').split('-');
+  if (parts.length >= 5) {
+    const tourney = parts.slice(4).join(' ');
+    return tourney || null;
+  }
+  return null;
+}
+
+/**
  * Round from a market title.
  *
  * Titles read "Will X win the A vs B: Round Of 16 match?", so the round sits between
@@ -157,6 +174,7 @@ async function upcomingForTour(tour) {
       startMs,
       round: roundFrom(uniq[0].title),
       pair: pairFrom(uniq[0].title),
+      tournament: tournamentFromTicker(ev),
       volume: uniq.reduce((s2, x) => s2 + x.volume, 0)
     });
   }
@@ -244,5 +262,5 @@ function splitByCoverage(fixtures, byTour) {
 
 module.exports = {
   upcoming, upcomingForTour, implied, surnameOf, surnameKeys, splitByCoverage,
-  indexBySurname, roundFrom, pairFrom, SERIES
+  indexBySurname, roundFrom, pairFrom, tournamentFromTicker, SERIES
 };

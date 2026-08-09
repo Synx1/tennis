@@ -577,6 +577,18 @@ async function onMatches(i) {
   const fmtWhen = ms => {
     if (!ms) return 'TBC';
     const d = new Date(ms);
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const isTomorrow = new Date(now.getTime() + 86400000).toDateString() === d.toDateString();
+    
+    const time = d.toLocaleString('en-US', {
+      hour: 'numeric', minute: '2-digit',
+      timeZone: 'America/New_York'
+    });
+    
+    if (isToday) return `Today ${time} ET`;
+    if (isTomorrow) return `Tomorrow ${time} ET`;
+    
     return d.toLocaleString('en-US', {
       month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
       timeZone: 'America/New_York'
@@ -595,13 +607,18 @@ async function onMatches(i) {
       const value = `${f.tour}|${live.surnameOf(f.playerA)}|${live.surnameOf(f.playerB)}`
         .slice(0, 100);
       const analysable = covered.includes(f);
+      
+      // Build description with tournament, round, time, and odds
+      const parts = [fmtWhen(f.startMs)];
+      if (f.tournament) parts.push(f.tournament);
+      if (f.round) parts.push(f.round);
+      parts.push(`${(f.priceA * 100).toFixed(0)}/${(f.priceB * 100).toFixed(0)}`);
+      if (!analysable) parts.push('no history');
+      
       return {
         label,
         value,
-        description: `${fmtWhen(f.startMs)} · ${f.tour.toUpperCase()}` +
-          `${f.round ? ' · ' + f.round : ''} · ` +
-          `${(f.priceA * 100).toFixed(0)}/${(f.priceB * 100).toFixed(0)}` +
-          (analysable ? '' : ' · no history'),
+        description: parts.join(' · ').slice(0, 100),
         emoji: analysable ? '🎾' : '❔'
       };
     }));
