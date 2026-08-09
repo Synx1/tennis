@@ -142,6 +142,113 @@ function surnameOf(name) {
 }
 
 /**
+ * The forename initial Kalshi gives us, lowercased, or null.
+ *
+ * `yes_sub_title` is forename-first ("Chenting Zhu", "Botic Van de Zandschulp"), so
+ * the first token is the forename and its first letter is the thing the history
+ * abbreviates. This is the field that separates two players sharing a surname, and
+ * not using it is what let a fixture for Junhan Zhang resolve against Zhang R.
+ */
+function forenameInitialOf(fullName) {
+  const first = String(fullName || '').trim().split(/\s+/)[0] || '';
+  const ch = first.replace(/[^A-Za-z]/g, '')[0];
+  return ch ? ch.toLowerCase() : null;
+}
+
+/**
+ * Split a history name into its surname and its initials.
+ *
+ * The source writes "<surname> <initials>.", where the surname may itself contain
+ * spaces and the initials may be several letters:
+ *
+ *   "Zhu C."                -> { surname: 'zhu',                initials: 'c'  }
+ *   "Van De Zandschulp B."  -> { surname: 'van de zandschulp',  initials: 'b'  }
+ *   "Tirante T.A."          -> { surname: 'tirante',            initials: 'ta' }
+ *   "Fernandez L. A."       -> { surname: 'fernandez',          initials: 'la' }
+ *
+ * A name carrying no initials returns initials '' rather than null, so callers can
+ * compare without special-casing.
+ */
+function splitHistoryName(historyName) {
+  const s = String(historyName || '').trim();
+  const m = s.match(/^(.*?)\s+([A-Za-z](?:\s*\.\s*[A-Za-z])*)\s*\.?\s*$/);
+  if (!m) return { surname: s.toLowerCase(), initials: '' };
+  return {
+    surname: m[1].trim().toLowerCase(),
+    initials: m[2].replace(/[^A-Za-z]/g, '').toLowerCase()
+  };
+}
+
+/**
+ * Are these two history names the same player recorded two ways?
+ *
+ * The source is inconsistent about middle initials, so one player appears as both
+ * "Fernandez L." and "Fernandez L.A.", and as both "Tirante T.A." and "Tirante T. A.".
+ * Identical surname plus prefix-compatible initials is the available evidence for
+ * that, and it is deliberately strict: "Zhang S." and "Zhang R." share a surname but
+ * their initials are not prefix-compatible, so they stay separate players.
+ *
+ * The residual risk is a real pair like "Zhang S." and "Zhang S.Q." being merged.
+ * Nothing in this data distinguishes that case from a middle initial recorded
+ * intermittently, so it is accepted and stated rather than silently assumed away.
+ */
+function isSpellingVariant(a, b) {
+  const x = splitHistoryName(a), y = splitHistoryName(b);
+  if (x.surname !== y.surname) return false;
+  const [short, long] = x.initials.length <= y.initials.length
+    ? [x.initials, y.initials] : [y.initials, x.initials];
+  return short.length > 0 && long.startsWith(short);
+}
+
+/**
+ * Resolve one Kalshi full name to history names, using the forename initial.
+ *
+ * Returns null when nothing matches, which is the common and correct answer: Kalshi
+ * lists mostly ITF and Challenger and this history covers tour level, so most
+ * players below tour level are genuinely absent.
+ *
+ * The initial is REQUIRED to agree. Matching on surname alone reported Junhan Zhang
+ * and Yuki Mochizuki as analysable when the history holds only Zhang R./Zhang S. and
+ * Mochizuki S., and picking one of those showed a different person's career with no
+ * warning. It also let "Martin VAN DER MEERSCHEN" reach Van de Zandschulp, Van
+ * Rijthoven and Van Assche through the shared "van" key.
+ *
+ * Keys are tried in order and a key whose candidates all fail the initial test does
+ * not stop the search, because "Botic Van de Zandschulp" has to fall through
+ * "zandschulp" (absent) to "van" (present) to be found at all.
+ *
+ * @returns {{key: string, names: string[], variant: boolean}|null}
+ *   names holds one player. More than one entry means spelling variants of that
+ *   same player, which the caller must union rather than choose between.
+ */
+function resolveInTour(index, fullName) {
+  const initial = forenameInitialOf(fullName);
+
+  for (const key of surnameKeys(fullName)) {
+    const candidates = index.get(key);
+    if (!candidates || !candidates.length) continue;
+
+    // Without an initial from Kalshi there is nothing to discriminate with, so a
+    // single candidate is accepted and anything more is left unresolved.
+    if (!initial) {
+      if (candidates.length === 1) return { key, names: [candidates[0]], variant: false };
+      continue;
+    }
+
+    const matching = candidates.filter(n => splitHistoryName(n).initials[0] === initial);
+    if (!matching.length) continue;
+    if (matching.length === 1) return { key, names: [matching[0]], variant: false };
+
+    // Several survive. Same player spelled differently is fine; genuinely different
+    // players sharing surname and initial are not resolvable and stay unresolved.
+    const allVariants = matching.every(n => isSpellingVariant(n, matching[0]));
+    if (allVariants) return { key, names: matching, variant: true };
+  }
+
+  return null;
+}
+
+/**
  * Every plausible surname key for a full name, because no single rule works.
  *
  * The history stores surname first ("Tirante T.A."), so its key is the LEADING token.
@@ -444,30 +551,23 @@ function splitByCoverage(fixtures, byTour) {
   const idx = {};
   for (const t of Object.keys(byTour)) idx[t] = indexBySurname(byTour[t] || []);
 
-  // Try each candidate key; still EXACT matches only, never a prefix. The KEY that
-  // matched is returned alongside the names, because the caller needs to hand
-  // something back to the history layer and a surname re-derived from the full name
-  // is not guaranteed to be that key — "Botic Van de Zandschulp" is indexed under
-  // "van", not "zandschulp".
-  const lookup = (names, full) => {
-    for (const k of surnameKeys(full)) {
-      const hit = names.get(k);
-      if (hit) return { key: k, names: hit };
-    }
-    return null;
-  };
-
   const covered = [], uncovered = [];
   for (const f of fixtures) {
     const names = idx[f.tour];
     if (!names) { uncovered.push(f); continue; }
-    const a = lookup(names, f.playerA);
-    const b = lookup(names, f.playerB);
+
+    // Surname AND forename initial must both agree, inside this fixture's own tour.
+    const a = resolveInTour(names, f.playerA);
+    const b = resolveInTour(names, f.playerB);
+
     if (a && b) {
       covered.push({
         ...f,
         resolvedA: a.names, resolvedB: b.names,
-        keyA: a.key, keyB: b.key
+        keyA: a.key, keyB: b.key,
+        // True when the history spells this player more than one way, so the caller
+        // unions the records instead of picking a spelling and losing the rest.
+        variantA: a.variant, variantB: b.variant
       });
     } else uncovered.push(f);
   }
@@ -478,5 +578,6 @@ module.exports = {
   upcoming, live, upcomingForTour, implied, surnameOf, surnameKeys, splitByCoverage,
   indexBySurname, roundFrom, tournamentFrom, detailFrom, splitDetail, pairFrom,
   byLiveThenSoonest, tickerDateUTC, dayUTC, scheduleIsStale,
+  forenameInitialOf, splitHistoryName, isSpellingVariant, resolveInTour,
   SERIES, SERIES_DEFS, LIVE_WINDOW_MS
 };

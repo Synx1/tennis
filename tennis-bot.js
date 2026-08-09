@@ -30,12 +30,41 @@
  *   node tennis-bot.js
  */
 
-// Load .env if present
-require('fs').existsSync('.env') && require('fs').readFileSync('.env', 'utf8')
-  .split(/\r?\n/).forEach(line => {
-    const m = line.trim().match(/^([^#=]+)=(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
-  });
+/**
+ * Load .env into process.env, without a dependency.
+ *
+ * Resolved against __dirname rather than the working directory. A CWD-relative path
+ * silently finds nothing when the process is started from anywhere other than the
+ * project root — a systemd unit, a scheduler, or `node ~/tennis/tennis-bot.js` — and
+ * the symptom is an unset token rather than a missing file, which is a needlessly
+ * confusing way to learn about it.
+ *
+ * Existing environment variables win, so a value set by the host is never
+ * overwritten by a stale local file.
+ */
+(function loadEnv() {
+  const fs = require('fs');
+  const file = require('path').join(__dirname, '.env');
+  if (!fs.existsSync(file)) return;
+  try {
+    for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+      const t = raw.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq < 1) continue;
+      const key = t.slice(0, eq).trim();
+      if (process.env[key] !== undefined) continue;      // environment wins
+      let val = t.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      process.env[key] = val;
+    }
+  } catch (e) {
+    console.error(`[tennis] could not read .env: ${e.message}`);
+  }
+})();
 
 const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes,
         SlashCommandBuilder, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
@@ -46,26 +75,51 @@ const live = require('./src/tennislive');
 const core = require('./src/tenniscore');
 
 /**
- * Token for THIS application.
+ * Token for THIS application. TENNIS_BOT_TOKEN only — never DISCORD_TOKEN.
  *
- * Reads from environment variable TENNIS_BOT_TOKEN. If not set, falls back to checking
- * DISCORD_TOKEN (for shared deployments), then finally errors with instructions.
+ * There is deliberately no fallback to DISCORD_TOKEN. That variable holds the CRYPTO
+ * bot's token in this workspace (application 1534343128176267372, against the tennis
+ * application 1535837744025043005), and onReady does a GLOBAL applicationCommands
+ * PUT. Falling back would have quietly registered /compare, /player, /h2h,
+ * /accuracy and /matches onto the crypto application and deleted /results, /weekly,
+ * /picks, /btc and /status — the precise accident this file's header describes, made
+ * more likely rather than less by a convenience fallback.
  *
- * Set via:
- *   export TENNIS_BOT_TOKEN=your_token_here
- * or create a .env file:
- *   TENNIS_BOT_TOKEN=your_token_here
+ * Set it in the environment, or in a .env file next to this script:
+ *   TENNIS_BOT_TOKEN=...
  */
-const TOKEN = (process.env.TENNIS_BOT_TOKEN || process.env.DISCORD_TOKEN || '')
-  .trim().replace(/^Bot\s+/i, '');
+const TOKEN = (process.env.TENNIS_BOT_TOKEN || '').trim().replace(/^Bot\s+/i, '');
 
-if (!TOKEN || TOKEN.split('.').length !== 3) {
-  console.error('[tennis] TENNIS_BOT_TOKEN or DISCORD_TOKEN environment variable not set');
-  console.error('[tennis] Create a .env file with:');
-  console.error('[tennis]   TENNIS_BOT_TOKEN=your_discord_bot_token_here');
-  console.error('[tennis] Or set the environment variable before running');
+/** The application id a bot token belongs to, or null if it is not decodable. */
+function applicationIdOf(token) {
+  const seg = String(token).split('.')[0] || '';
+  try {
+    const b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+    const id = Buffer.from(b64, 'base64').toString('utf8');
+    return /^\d{17,20}$/.test(id) ? id : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+if (!TOKEN) {
+  console.error('[tennis] TENNIS_BOT_TOKEN is not set.');
+  console.error('[tennis] Put it in a .env file beside tennis-bot.js:');
+  console.error('[tennis]     TENNIS_BOT_TOKEN=...');
+  console.error('[tennis] or set it in the environment. DISCORD_TOKEN is NOT used:');
+  console.error('[tennis] it belongs to a different application, and registering this');
+  console.error('[tennis] bot\'s commands there would delete that bot\'s commands.');
   process.exit(1);
 }
+if (TOKEN.split('.').length !== 3) {
+  console.error(`[tennis] TENNIS_BOT_TOKEN has ${TOKEN.split('.').length} dot-separated ` +
+    `segment(s), expected 3 — this looks like a client secret or an application id, ` +
+    `not a bot token.`);
+  process.exit(1);
+}
+// console.log, not `line`: that binding is declared further down and is still in
+// its temporal dead zone here.
+console.log(`[tennis] token resolves to application ${applicationIdOf(TOKEN) || '(undecodable)'}`);
 
 /** How many seasons of history to load. Career figures need depth; loading is cached. */
 const CAREER_FROM = new Date().getFullYear() - 6;
@@ -690,23 +744,22 @@ async function onMatches(i) {
        * a surname is what resolved "Zhu" to "Zhukayev": the surname existed in the
        * wrong tour's list and was prefix-matched to a different player.
        *
-       * The NAMES are the exact history names when coverage resolved them to one
-       * player, otherwise the surname KEY that matched the index. Both come from the
-       * lookup that already succeeded, so they are guaranteed to resolve on the way
-       * back. Re-deriving a surname here with surnameOf() was wrong for particled
-       * names: "Botic Van de Zandschulp" gives "zandschulp" while the history is
-       * keyed on "van", so the round trip failed for exactly the players the
-       * surnameKeys() helper exists to handle.
+       * The NAMES are the exact history names that coverage already resolved, joined
+       * with '~' when the history spells one player several ways. Nothing is
+       * re-derived here. Passing a surname KEY instead is what produced
+       * "zhang is ambiguous: Zhang R., Zhang S." — the key had thrown away the
+       * forename initial that resolution had just used.
+       *
+       * Unanalysable fixtures are listed too (live ones always are), and for those
+       * there is no resolved name to send. The full Kalshi name goes instead so the
+       * failure message can name the player the user actually clicked.
        */
-      const side = (resolved, key, fallback) => {
-        if (resolved && resolved.length === 1) return resolved[0];
-        if (key) return key;
-        return live.surnameKeys(fallback)[0] || fallback;
-      };
+      const side = (resolved, fallback) =>
+        (resolved && resolved.length) ? resolved.join('~') : fallback;
       const value = [
         f.tour,
-        side(f.resolvedA, f.keyA, f.playerA),
-        side(f.resolvedB, f.keyB, f.playerB)
+        side(f.resolvedA, f.playerA),
+        side(f.resolvedB, f.playerB)
       ].join('|').slice(0, 100);
 
       // Status/time first, then the competition, round, price, and any warning.
@@ -770,53 +823,109 @@ async function onMatches(i) {
  * menu and the menu stays usable for the next match — which is what "updates happen
  * with reply" asks for.
  */
+/**
+ * All of a player's matches, unioned across the spellings the source uses for them.
+ *
+ * forPlayer() compares names with ===, so "Fernandez L." and "Fernandez L.A." are two
+ * different players to it and each holds part of one record. Concatenating and
+ * re-sorting is what makes a variant pair behave as the single player it is.
+ */
+function viewsForNames(matches, names) {
+  if (names.length === 1) return stats.forPlayer(matches, names[0]);
+  return names
+    .flatMap(n => stats.forPlayer(matches, n))
+    .sort((x, y) => (y.match.date?.getTime() || 0) - (x.match.date?.getTime() || 0));
+}
+
+/** Head-to-head across every spelling of both players. */
+function h2hForNames(matches, aNames, bNames) {
+  if (aNames.length === 1 && bNames.length === 1) {
+    return stats.headToHead(matches, aNames[0], bNames[0]);
+  }
+  const aSet = new Set(aNames), bSet = new Set(bNames);
+  // Rewrite to one canonical spelling per side, then ask the normal question.
+  const canonA = aNames[0], canonB = bNames[0];
+  const rewritten = matches
+    .filter(m => (aSet.has(m.winner) && bSet.has(m.loser)) ||
+                 (bSet.has(m.winner) && aSet.has(m.loser)))
+    .map(m => ({
+      ...m,
+      winner: aSet.has(m.winner) ? canonA : canonB,
+      loser: aSet.has(m.loser) ? canonA : canonB
+    }));
+  return stats.headToHead(rewritten, canonA, canonB);
+}
+
 async function onPickMatch(i) {
-  // Tour comes from Kalshi via the menu value, so nothing is inferred from a surname.
-  const [tourRaw, snA, snB] = String(i.values[0]).split('|');
+  // Everything in the value was produced by a lookup that already succeeded: the
+  // tour comes from Kalshi, and the names are exact history names. Nothing is
+  // re-resolved from a surname here, which is what previously reintroduced the
+  // ambiguity that coverage had already settled.
+  const [tourRaw, rawA, rawB] = String(i.values[0]).split('|');
   const tour = (tourRaw === 'atp' || tourRaw === 'wta') ? tourRaw : 'atp';
   const { matches, names } = await history(tour);
 
-  // exact: true. A fixture pick must never fall back to a prefix — that is the
-  // "Zhu" -> "Zhukayev" failure, and showing a different player's career without
-  // saying so is worse than refusing. Live ITF and Challenger matches are listed
-  // whether or not history exists, so landing here with no match is expected and
-  // gets an explanation rather than a crash.
-  const a = pick(snA, names, { exact: true });
-  const b = pick(snB, names, { exact: true });
-  if (a.error || b.error) {
+  const known = new Set(names);
+  const parseSide = raw => {
+    const parts = String(raw || '').split('~').filter(Boolean);
+    const hits = parts.filter(p => known.has(p));
+    return { hits, raw: parts.join(' / ') || String(raw || '') };
+  };
+  const a = parseSide(rawA);
+  const b = parseSide(rawB);
+
+  // A live ITF or Challenger match is listed whether or not history exists, so
+  // arriving here with nothing to look up is expected rather than exceptional.
+  if (!a.hits.length || !b.hits.length) {
+    const missing = [!a.hits.length ? a.raw : null, !b.hits.length ? b.raw : null]
+      .filter(Boolean);
     return i.editReply(
-      `${a.error || ''}${a.error && b.error ? '\n' : ''}${b.error || ''}\n\n` +
-      `_Resolved against ${tour.toUpperCase()} history, exact surname only. Kalshi ` +
-      `lists mostly ITF and Challenger matches and this history covers tour level, ` +
-      `so most players below tour level are genuinely absent rather than misspelled. ` +
-      `Try \`/compare\` with full names and an explicit tour._`);
+      `No ${tour.toUpperCase()} history for **${missing.join('** and **')}**.\n\n` +
+      `_This match is listed because it is in progress on Kalshi, not because it can ` +
+      `be analysed. Kalshi lists mostly ITF and Challenger, and this history covers ` +
+      `tour level, so players below tour level are genuinely absent. Matching ` +
+      `requires the surname AND the forename initial to agree, which is what stops a ` +
+      `fixture for one player resolving to a different one who happens to share a ` +
+      `surname._`);
   }
 
   // Surface is unknown from the fixture feed, so career-wide figures are used and
   // the absence is stated rather than a surface being guessed.
-  const vA = stats.forPlayer(matches, a.name);
-  const vB = stats.forPlayer(matches, b.name);
+  const vA = viewsForNames(matches, a.hits);
+  const vB = viewsForNames(matches, b.hits);
   const opts = { year: CAREER_TO, surface: null };
   const pA = stats.profile(vA, opts);
   const pB = stats.profile(vB, opts);
-  const h2h = stats.headToHead(matches, a.name, b.name);
+  const h2h = h2hForNames(matches, a.hits, b.hits);
   const pred = predictor.predict(pA, pB, h2h);
 
-  const favourite = pred.pA >= 0.5 ? a.name : b.name;
+  // One spelling per side for display. Where the source uses several, the first is
+  // shown and the rest are named in the footnote, so a merged record is visible
+  // rather than implied.
+  const nameA = a.hits[0], nameB = b.hits[0];
+  const favourite = pred.pA >= 0.5 ? nameA : nameB;
   const favP = Math.max(pred.pA, pred.pB);
+
+  const variantNote = [
+    a.hits.length > 1 ? `${nameA} also recorded as ${a.hits.slice(1).join(', ')}` : null,
+    b.hits.length > 1 ? `${nameB} also recorded as ${b.hits.slice(1).join(', ')}` : null
+  ].filter(Boolean);
 
   const e = new EmbedBuilder()
     .setColor(0x2ecc71)
-    .setTitle(`${a.name}  vs  ${b.name}`)
+    .setTitle(`${nameA}  vs  ${nameB}`)
     .setDescription(
       `**${favourite}** favoured at **${(favP * 100).toFixed(0)}%** on the stats\n` +
       `Head to head: **${h2h.aWins}-${h2h.bWins}**` +
       (h2h.n ? ` in ${h2h.n} meeting${h2h.n === 1 ? '' : 's'}` : ' — never met') +
       `\n_${tour.toUpperCase()} · ${vA.length} and ${vB.length} matches on record · ` +
-      `surface not known from the fixture, so figures are career-wide_`
+      `surface not known from the fixture, so figures are career-wide_` +
+      (variantNote.length
+        ? `\n_Records combined across spellings — ${variantNote.join('; ')}._`
+        : '')
     )
     .addFields(
-      { name: 'Why', value: reasoning(pred, a.name, b.name) },
+      { name: 'Why', value: reasoning(pred, nameA, nameB) },
       { name: 'Trust', value:
         `Evidence weight **${(pred.evidence * 100).toFixed(0)}%**. This model scores ` +
         `**64.1%** accuracy against the market's **67.6%** over 4,617 past matches, ` +
@@ -824,7 +933,7 @@ async function onPickMatch(i) {
     )
     .setFooter({ text: 'Green = higher.  * = under 10 matches.' });
 
-  return i.editReply({ content: comparisonBlock(a.name, b.name, pA, pB, null), embeds: [e] });
+  return i.editReply({ content: comparisonBlock(nameA, nameB, pA, pB, null), embeds: [e] });
 }
 
 async function onAccuracy(i) {
