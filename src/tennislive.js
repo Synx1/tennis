@@ -151,9 +151,15 @@ async function upcomingForTour(tour) {
     if (uniq.length < 2) continue;
 
     const startMs = uniq.map(s => s.startMs).find(t => isFinite(t)) || null;
+    
+    // Calculate match status
+    const isUpcoming = !startMs || startMs > now;
+    const isLive = startMs && startMs <= now && startMs > now - 6 * 3600 * 1000;
+    const isFinished = startMs && startMs < now - 6 * 3600 * 1000;
+    
     // Drop matches that finished more than six hours ago; Kalshi keeps them open
     // until settlement, which is up to two weeks after play.
-    if (startMs && startMs < now - 6 * 3600 * 1000) continue;
+    if (isFinished) continue;
 
     // Mid price per side, then normalised so the pair sums to one.
     const mid = s => {
@@ -172,6 +178,8 @@ async function upcomingForTour(tour) {
       priceA: sum > 0 ? mA / sum : 0.5,
       priceB: sum > 0 ? mB / sum : 0.5,
       startMs,
+      isLive,
+      isUpcoming,
       round: roundFrom(uniq[0].title),
       pair: pairFrom(uniq[0].title),
       tournament: tournamentFromTicker(ev),
@@ -180,6 +188,9 @@ async function upcomingForTour(tour) {
   }
 
   out.sort((a, b) => {
+    // Live matches first, then upcoming, sorted by time within each group
+    if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+    
     const ta = a.startMs == null ? Infinity : a.startMs;
     const tb = b.startMs == null ? Infinity : b.startMs;
     if (ta !== tb) return ta - tb;
@@ -188,13 +199,16 @@ async function upcomingForTour(tour) {
   return out;
 }
 
-/** Open matches across both tours, soonest first. */
+/** Open matches across both tours, live first then soonest upcoming. */
 async function upcoming({ limit = 25 } = {}) {
   const [atp, wta] = await Promise.all([
     upcomingForTour('atp'),
     upcomingForTour('wta')
   ]);
   const all = [...atp, ...wta].sort((a, b) => {
+    // Live matches first, then upcoming
+    if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+    
     const ta = a.startMs == null ? Infinity : a.startMs;
     const tb = b.startMs == null ? Infinity : b.startMs;
     if (ta !== tb) return ta - tb;

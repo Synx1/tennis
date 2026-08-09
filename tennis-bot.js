@@ -596,13 +596,23 @@ async function onMatches(i) {
       timeZone: 'America/New_York'
     });
     
-    if (isToday) return `Today ${time} ET`;
-    if (isTomorrow) return `Tomorrow ${time} ET`;
+    if (isToday) return `Today ${time}`;
+    if (isTomorrow) return `Tomorrow ${time}`;
     
     return d.toLocaleString('en-US', {
       month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
       timeZone: 'America/New_York'
-    }) + ' ET';
+    });
+  };
+  
+  const fmtStatus = f => {
+    if (f.isLive) {
+      const elapsed = Math.floor((Date.now() - f.startMs) / 60000);
+      if (elapsed < 60) return `🔴 LIVE (${elapsed}m)`;
+      const hours = Math.floor(elapsed / 60);
+      return `🔴 LIVE (${hours}h ${elapsed % 60}m)`;
+    }
+    return fmtWhen(f.startMs);
   };
 
   const menu = new StringSelectMenuBuilder()
@@ -618,8 +628,8 @@ async function onMatches(i) {
         .slice(0, 100);
       const analysable = covered.includes(f);
       
-      // Build description with tournament, round, time, and odds
-      const parts = [fmtWhen(f.startMs)];
+      // Build description with status/time, tournament, round, and odds
+      const parts = [fmtStatus(f)];
       if (f.tournament) parts.push(f.tournament);
       if (f.round) parts.push(f.round);
       parts.push(`${(f.priceA * 100).toFixed(0)}/${(f.priceB * 100).toFixed(0)}`);
@@ -629,7 +639,7 @@ async function onMatches(i) {
         label,
         value,
         description: parts.join(' · ').slice(0, 100),
-        emoji: analysable ? '🎾' : '❔'
+        emoji: f.isLive ? '🔴' : (analysable ? '🎾' : '❔')
       };
     }));
 
@@ -645,8 +655,10 @@ async function onMatches(i) {
           ? `\n_${uncovered.length} hidden (no history for one or both players). ` +
             `Use \`all:true\` to see them._`
           : '') +
-      `\n\nTimes are the scheduled START, from Kalshi's \`occurrence_datetime\`. ` +
-      `Percentages are Kalshi's live price — the benchmark, not this bot's prediction.`
+      `\n\n🔴 = **LIVE NOW** (match in progress)\n` +
+      `🎾 = Both players in history (analysable)\n` +
+      `❔ = One or both players not in history\n\n` +
+      `Times are ET. Prices are Kalshi's live odds (devigged).`
     )
     .setFooter({ text: 'Fixtures from Kalshi · stats from tennis-data.co.uk + MCP' });
 
