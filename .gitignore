@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 *.swp
 *~
+
+# api-tennis response cache. Derived data, rebuilt on demand, and keyed to whatever
+# API_TENNIS_KEY is configured — not something to track.
+data/tennis-api/

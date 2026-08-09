@@ -73,6 +73,7 @@ const stats = require('./src/tennisstats');
 const predictor = require('./src/tennispredict');
 const live = require('./src/tennislive');
 const core = require('./src/tenniscore');
+const api = require('./src/tennisapi');
 
 /**
  * Token for THIS application. TENNIS_BOT_TOKEN only — never DISCORD_TOKEN.
@@ -481,8 +482,31 @@ async function onCompare(i) {
   const surface = i.options.getString('surface') || null;
   const { matches, names, missing } = await history(tour);
 
-  const a = pick(i.options.getString('player1'), names);
-  const b = pick(i.options.getString('player2'), names);
+  const rawA = i.options.getString('player1');
+  const rawB = i.options.getString('player2');
+  const a = pick(rawA, names);
+  const b = pick(rawB, names);
+
+  /**
+   * Not in tour-level history: try api-tennis before giving up.
+   *
+   * Only when a name is genuinely ABSENT, not when it is ambiguous — an ambiguous
+   * query is a question for the user, and silently resolving it against a second
+   * source would answer a different question than the one asked.
+   */
+  const absent = e => typeof e === 'string' && /^No player matching/.test(e);
+  if ((a.error && absent(a.error)) || (b.error && absent(b.error))) {
+    const c = await apiComparison(tour, rawA, rawB);
+    if (!c.error) {
+      return i.editReply({
+        content: comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null),
+        embeds: [apiEmbed(c)]
+      });
+    }
+    return i.editReply(
+      `${a.error || ''}${a.error && b.error ? '\n' : ''}${b.error || ''}\n\n${c.error}`);
+  }
+
   if (a.error || b.error) {
     return i.editReply(`${a.error || ''}${a.error && b.error ? '\n' : ''}${b.error || ''}`);
   }
@@ -640,6 +664,141 @@ async function onH2H(i) {
 async function allNames() {
   const [atp, wta] = await Promise.all([history('atp'), history('wta')]);
   return { atp, wta, byTour: { atp: atp.names, wta: wta.names } };
+}
+
+// ── below-tour-level comparison, via api-tennis ─────────────────
+//
+// tennis-data.co.uk stops at tour level, so ITF and Challenger players — the
+// majority of Kalshi's board — had no statistics at all. api-tennis covers them and
+// publishes per-set scores, which is what lets the SAME stats engine run on them
+// rather than a reduced parallel one.
+
+/** How many seasons of api-tennis history to pull. Each season is one cached call. */
+const API_SEASONS_BACK = 3;
+
+/**
+ * Resolve one player and load their normalised match history from api-tennis.
+ *
+ * Widening windows because there is no player-search endpoint: a key can only be
+ * discovered by finding the player in a fixture list. Coming from a live Kalshi
+ * fixture the player is on court today and the first window hits immediately; a name
+ * typed into /compare may belong to someone who last played weeks ago, so the search
+ * widens before giving up.
+ */
+async function apiSideFor(fullName, tour, { around = new Date() } = {}) {
+  for (const windowDays of [3, 14, 45]) {
+    const found = await api.findPlayerKey(fullName, { tour, around, windowDays });
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * A full two-player comparison built from api-tennis.
+ *
+ * Both sides come from the same source deliberately. Mixing a tour-level profile with
+ * an api-tennis one would compare figures drawn from different match populations
+ * under different name spaces, and head-to-head would be impossible to compute at
+ * all, so if either player needs api-tennis then both use it.
+ */
+async function apiComparison(tour, nameA, nameB, { around = new Date() } = {}) {
+  if (!api.available()) {
+    return { error: 'API_TENNIS_KEY is not configured, so below-tour-level players cannot be looked up.' };
+  }
+
+  const [ka, kb] = await Promise.all([
+    apiSideFor(nameA, tour, { around }).catch(() => null),
+    apiSideFor(nameB, tour, { around }).catch(() => null)
+  ]);
+
+  const missing = [!ka ? nameA : null, !kb ? nameB : null].filter(Boolean);
+  if (missing.length) {
+    return { error: `api-tennis has no ${tour.toUpperCase()} singles record for ` +
+      `**${missing.join('** or **')}**.` };
+  }
+  if (ka.key === kb.key) return { error: 'Those resolve to the same player.' };
+
+  const toYear = new Date().getUTCFullYear();
+  const fromYear = toYear - API_SEASONS_BACK;
+
+  const [mA, mB, prA, prB] = await Promise.all([
+    api.playerMatches(ka.key, { fromYear, toYear, tour, log: line }),
+    api.playerMatches(kb.key, { fromYear, toYear, tour, log: line }),
+    api.playerProfile(ka.key).catch(() => null),
+    api.playerProfile(kb.key).catch(() => null)
+  ]);
+
+  // One pool, so head-to-head sees both sides of every meeting exactly once.
+  const byEvent = new Map();
+  for (const m of [...mA, ...mB]) byEvent.set(m.eventKey || Math.random(), m);
+  const pool = [...byEvent.values()];
+
+  const vA = stats.forPlayer(pool, ka.apiName);
+  const vB = stats.forPlayer(pool, kb.apiName);
+  if (!vA.length || !vB.length) {
+    return { error: `api-tennis returned no completed singles matches for ` +
+      `**${!vA.length ? ka.apiName : kb.apiName}** in ${fromYear}-${toYear}.` };
+  }
+
+  // No surface: api-tennis fixtures do not carry one, so a surface split here would
+  // be an empty set dressed up as a statistic.
+  const opts = { year: toYear, surface: null };
+  const pA = stats.profile(vA, opts);
+  const pB = stats.profile(vB, opts);
+  const h2h = stats.headToHead(pool, ka.apiName, kb.apiName);
+  const pred = predictor.predict(pA, pB, h2h);
+
+  return {
+    tour, fromYear, toYear,
+    a: { ...ka, views: vA, profile: pA, meta: prA },
+    b: { ...kb, views: vB, profile: pB, meta: prB },
+    h2h, pred
+  };
+}
+
+/** Rank and career surface record, the two things only get_players carries. */
+function apiMetaLine(side) {
+  if (!side.meta) return `${side.apiName}: no profile on record`;
+  const r = api.rankSummary(side.meta);
+  const s = api.surfaceTotals(side.meta);
+  const rec = ([w, l]) => (w + l) ? `${w}-${l}` : '—';
+  return `**${side.apiName}** · rank ${r.current ?? '—'}` +
+    (r.best ? ` (best ${r.best} in ${r.bestSeason})` : '') +
+    ` · hard ${rec(s.hard)} · clay ${rec(s.clay)} · grass ${rec(s.grass)}`;
+}
+
+/** Render an api-tennis comparison into the same shape /compare produces. */
+function apiEmbed(c) {
+  const favourite = c.pred.pA >= 0.5 ? c.a.apiName : c.b.apiName;
+  const favP = Math.max(c.pred.pA, c.pred.pB);
+
+  const e = new EmbedBuilder()
+    .setColor(0xe67e22)
+    .setTitle(`${c.a.apiName}  vs  ${c.b.apiName}`)
+    .setDescription(
+      `**${favourite}** favoured at **${(favP * 100).toFixed(0)}%** on the stats\n` +
+      `Head to head: **${c.h2h.aWins}-${c.h2h.bWins}**` +
+      (c.h2h.n ? ` in ${c.h2h.n} meeting${c.h2h.n === 1 ? '' : 's'}` : ' — never met') + '\n' +
+      `_${c.tour.toUpperCase()} · ${c.a.views.length} and ${c.b.views.length} matches ` +
+      `on record, ${c.fromYear}-${c.toYear}_`
+    )
+    .addFields(
+      { name: 'Rank and surface', value: `${apiMetaLine(c.a)}\n${apiMetaLine(c.b)}` },
+      { name: 'Why', value: reasoning(c.pred, c.a.apiName, c.b.apiName) },
+      { name: 'Source', value:
+        `Below tour level, so this comes from **api-tennis**, not tennis-data.co.uk. ` +
+        `Set-by-set records are real — every fixture carries per-set games — but ` +
+        `there is **no surface on a match**, so the table is career-wide and the ` +
+        `surface line above is a season total that cannot be crossed with anything ` +
+        `else. Serve statistics are not offered: the API returned an empty ` +
+        `statistics array for every match checked at this level.\n` +
+        `The 64.1% accuracy figure was measured on tour-level data and has **not** ` +
+        `been re-measured here, so treat the percentage as a description of these ` +
+        `records rather than a validated forecast.` }
+    )
+    .setFooter({ text: 'Green = higher.  * = under 10 matches.  Source: api-tennis' });
+
+  return e;
 }
 
 async function onMatches(i) {
@@ -874,19 +1033,27 @@ async function onPickMatch(i) {
   const a = parseSide(rawA);
   const b = parseSide(rawB);
 
-  // A live ITF or Challenger match is listed whether or not history exists, so
-  // arriving here with nothing to look up is expected rather than exceptional.
+  /**
+   * Below tour level, fall through to api-tennis rather than refusing.
+   *
+   * This is the case for most of Kalshi's board, so refusing here is refusing the
+   * common path. Both sides are re-resolved against api-tennis, using the ORIGINAL
+   * Kalshi names carried in the menu value, because the two sources do not share a
+   * name space and half a comparison from each would be meaningless.
+   */
   if (!a.hits.length || !b.hits.length) {
-    const missing = [!a.hits.length ? a.raw : null, !b.hits.length ? b.raw : null]
-      .filter(Boolean);
-    return i.editReply(
-      `No ${tour.toUpperCase()} history for **${missing.join('** and **')}**.\n\n` +
-      `_This match is listed because it is in progress on Kalshi, not because it can ` +
-      `be analysed. Kalshi lists mostly ITF and Challenger, and this history covers ` +
-      `tour level, so players below tour level are genuinely absent. Matching ` +
-      `requires the surname AND the forename initial to agree, which is what stops a ` +
-      `fixture for one player resolving to a different one who happens to share a ` +
-      `surname._`);
+    const c = await apiComparison(tour, a.raw, b.raw);
+    if (c.error) {
+      return i.editReply(
+        `No ${tour.toUpperCase()} history for **${[
+          !a.hits.length ? a.raw : null, !b.hits.length ? b.raw : null
+        ].filter(Boolean).join('** and **')}**, and ${c.error}\n\n` +
+        `_Listed because it is in progress on Kalshi, not because it can be analysed._`);
+    }
+    return i.editReply({
+      content: comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null),
+      embeds: [apiEmbed(c)]
+    });
   }
 
   // Surface is unknown from the fixture feed, so career-wide figures are used and
