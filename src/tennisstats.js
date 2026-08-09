@@ -59,9 +59,19 @@ function rate(wins, n) {
  * list with each pair reversed. Getting this backwards silently inverts every
  * conditional statistic, which is why it lives in one place.
  */
-function perspective(match, player) {
-  const isWinner = match.winner === player;
-  if (!isWinner && match.loser !== player) return null;
+function perspective(match, player, { side = null } = {}) {
+  // `side` lets a caller state which player this is when identity is known from
+  // something stronger than the name — an api-tennis player key, for instance.
+  // Matching on the displayed name is unsafe there: api-tennis writes initial plus
+  // surname, and "Y. Sun", "J. Lu" and "Y. Wang" were each measured covering TWO
+  // different player keys inside a single pair of match histories. Merging two people
+  // under one name corrupts every figure downstream, win/loss first.
+  const isWinner = side ? side === 'winner' : match.winner === player;
+  if (side) {
+    if (side !== 'winner' && side !== 'loser') return null;
+  } else if (!isWinner && match.loser !== player) {
+    return null;
+  }
   const sets = match.sets.map(([a, b]) => (isWinner ? [a, b] : [b, a]));
   return {
     match,
@@ -77,12 +87,53 @@ function perspective(match, player) {
   };
 }
 
-/** Every match a player appears in, newest first. */
+const byDateDesc = (a, b) =>
+  (b.match.date?.getTime() || 0) - (a.match.date?.getTime() || 0);
+
+/** Every match a player appears in, newest first, matched on the displayed name. */
 function forPlayer(matches, player) {
   return matches
     .map(m => perspective(m, player))
     .filter(Boolean)
-    .sort((a, b) => (b.match.date?.getTime() || 0) - (a.match.date?.getTime() || 0));
+    .sort(byDateDesc);
+}
+
+/**
+ * Every match a player appears in, matched on a stable ID rather than a name.
+ *
+ * Used for api-tennis, where matches carry winnerKey/loserKey. Names there are
+ * initial-plus-surname and demonstrably ambiguous — three collisions turned up inside
+ * two players' histories alone — so identity comes from the key and the name is only
+ * ever used for display.
+ */
+function forPlayerKey(matches, key) {
+  const want = String(key);
+  return matches
+    .map(m => {
+      const side = String(m.winnerKey) === want ? 'winner'
+        : String(m.loserKey) === want ? 'loser' : null;
+      if (!side) return null;
+      return perspective(m, side === 'winner' ? m.winner : m.loser, { side });
+    })
+    .filter(Boolean)
+    .sort(byDateDesc);
+}
+
+/** Head-to-head matched on IDs, for the same reason as forPlayerKey. */
+function headToHeadKeys(matches, keyA, keyB) {
+  const a = String(keyA), b = String(keyB);
+  const met = matches.filter(m => {
+    const w = String(m.winnerKey), l = String(m.loserKey);
+    return (w === a && l === b) || (w === b && l === a);
+  });
+  const aWins = met.filter(m => String(m.winnerKey) === a).length;
+  return {
+    n: met.length,
+    aWins,
+    bWins: met.length - aWins,
+    matches: met.slice().sort((x, y) => (y.date?.getTime() || 0) - (x.date?.getTime() || 0)),
+    rate: rate(aWins, met.length)
+  };
 }
 
 /**
@@ -225,6 +276,6 @@ function percentile(value, population) {
 }
 
 module.exports = {
-  wilson, rate, perspective, forPlayer, profile, headToHead, percentile,
-  MIN_RELIABLE
+  wilson, rate, perspective, forPlayer, forPlayerKey, profile,
+  headToHead, headToHeadKeys, percentile, MIN_RELIABLE
 };

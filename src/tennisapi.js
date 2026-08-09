@@ -315,6 +315,14 @@ function normalise(fixture, tour) {
 
   const winner = firstWon ? first : second;
   const loser = firstWon ? second : first;
+  // Identity carried alongside the display name. Names here are initial-plus-surname
+  // and provably ambiguous — "Y. Sun", "J. Lu" and "Y. Wang" each covered two distinct
+  // player keys within a single pair of match histories — so anything that decides
+  // whose match this is must use the key.
+  const firstKey = String(fixture.first_player_key || '');
+  const secondKey = String(fixture.second_player_key || '');
+  const winnerKey = firstWon ? firstKey : secondKey;
+  const loserKey = firstWon ? secondKey : firstKey;
 
   const sets = [];
   for (const s of (fixture.scores || [])) {
@@ -368,6 +376,8 @@ function normalise(fixture, tour) {
     bestOf: 3,
     winner,
     loser,
+    winnerKey,
+    loserKey,
     winnerRank: null,
     loserRank: null,
     sets,

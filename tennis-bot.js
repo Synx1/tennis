@@ -1032,76 +1032,137 @@ async function apiComparisonResolved(tour, ka, kb, pre = {}) {
   const pool = [...byEvent.values()];
 
   /**
-   * The name to look the player up by, inferred from their own matches.
+   * Identity is the api-tennis player KEY, never the displayed name.
    *
-   * playerMatches(key) returns only that player's fixtures, so their name is the one
-   * appearing in EVERY row — which is a more reliable identifier than the profile's
-   * `player_name`. Those two are usually identical, but the profile is a separate
-   * endpoint and a spelling difference there would silently produce an empty record.
+   * Names there are initial-plus-surname, and an audit of two players' histories found
+   * three names each covering TWO different player keys ("Y. Sun", "J. Lu", "Y. Wang").
+   * Looking a player up by name in a merged pool therefore risks folding a second
+   * person's matches into their record, which corrupts win/loss before anything else.
+   * The name is now only ever used for display.
    */
-  const nameFromMatches = (rows, fallback) => {
+  const vA = stats.forPlayerKey(pool, ka.key);
+  const vB = stats.forPlayerKey(pool, kb.key);
+
+  /** The name this player actually appears under, for display only. */
+  const displayFor = (views, fallback) => {
     const count = new Map();
-    for (const m of rows) {
-      for (const n of [m.winner, m.loser]) count.set(n, (count.get(n) || 0) + 1);
+    for (const v of views) {
+      const n = v.won ? v.match.winner : v.match.loser;
+      count.set(n, (count.get(n) || 0) + 1);
     }
     let best = fallback, bestN = 0;
     for (const [n, c] of count) if (c > bestN) { best = n; bestN = c; }
     return best;
   };
 
-  const dispA = nameFromMatches(mA, ka.apiName);
-  const dispB = nameFromMatches(mB, kb.apiName);
-
-  const vA = stats.forPlayer(pool, dispA);
-  const vB = stats.forPlayer(pool, dispB);
   if (!vA.length || !vB.length) {
+    const missing = !vA.length ? ka.apiName : kb.apiName;
     return { error: `api-tennis returned no completed singles matches for ` +
-      `**${!vA.length ? dispA : dispB}** in ${fromYear}-${toYear}.` };
+      `**${missing}** in ${fromYear}-${toYear}.` };
   }
-  ka = { ...ka, apiName: dispA };
-  kb = { ...kb, apiName: dispB };
+
+  ka = { ...ka, apiName: displayFor(vA, ka.apiName) };
+  kb = { ...kb, apiName: displayFor(vB, kb.apiName) };
 
   // No surface: api-tennis fixtures do not carry one, so a surface split here would
   // be an empty set dressed up as a statistic.
   const opts = { year: toYear, surface: null };
   const pA = stats.profile(vA, opts);
   const pB = stats.profile(vB, opts);
-  const h2h = stats.headToHead(pool, ka.apiName, kb.apiName);
+  // Keys again, not names, for exactly the same reason.
+  const h2h = stats.headToHeadKeys(pool, ka.key, kb.key);
   const pred = predictor.predict(pA, pB, h2h);
+
+  // Win-loss stated explicitly. Audited against the API's own published season totals:
+  // completed seasons reconciled exactly (C. Zhu 2025 27-20, Dellavedova 2025 43-36,
+  // Mochizuki 2024 24-22), so this count is sound. It includes qualifying and every
+  // level the player appeared at, which is why it can exceed a published main-draw
+  // figure. Retirements count for win/loss and are excluded from set statistics.
+  const rec = views => {
+    const w = views.filter(v => v.won).length;
+    return `${w}-${views.length - w}`;
+  };
 
   return {
     tour, fromYear, toYear,
-    a: { ...ka, views: vA, profile: pA, meta: prA },
-    b: { ...kb, views: vB, profile: pB, meta: prB },
+    a: { ...ka, views: vA, profile: pA, meta: prA, record: rec(vA) },
+    b: { ...kb, views: vB, profile: pB, meta: prB, record: rec(vB) },
     h2h, pred
   };
 }
 
-/** Rank and career surface record, the two things only get_players carries. */
+/**
+ * Rank and career surface record, the two things only get_players carries.
+ *
+ * The CURRENT season's row from that endpoint is not trustworthy: audited against the
+ * fixture list, Mochizuki's 2026 row read 0-1 while 34 decided matches were on file
+ * from January to August, and Dellavedova's read 21-16 against 96. Completed seasons
+ * reconciled exactly, so only the in-progress season is suspect — and its rank comes
+ * from the same row, so it is labelled rather than presented as fact.
+ */
 function apiMetaLine(side) {
   if (!side.meta) return `${side.apiName}: no profile on record`;
   const r = api.rankSummary(side.meta);
   const s = api.surfaceTotals(side.meta);
   const rec = ([w, l]) => (w + l) ? `${w}-${l}` : '—';
+  const thisYear = String(new Date().getUTCFullYear());
+  const curIsThisSeason = api.singlesSeasons(side.meta)
+    .some(x => String(x.season) === thisYear && Number(x.rank) === r.current);
+
   return `**${side.apiName}** · rank ${r.current ?? '—'}` +
-    (r.best ? ` (best ${r.best} in ${r.bestSeason})` : '') +
+    (curIsThisSeason ? ' _(in-season, may lag)_' : '') +
+    (r.best ? ` · best ${r.best} in ${r.bestSeason}` : '') +
     ` · hard ${rec(s.hard)} · clay ${rec(s.clay)} · grass ${rec(s.grass)}`;
+}
+
+/**
+ * Whether these two records can carry the comparison at all.
+ *
+ * The archive thins out at lower levels and in older seasons — J. Zhang's 2023 returned
+ * three fixtures against a published eight — so one side can arrive with a dozen matches
+ * against the other's two hundred. A percentage off twelve matches next to one off two
+ * hundred reads as though the two mean the same thing, and the predictor will still name
+ * a favourite. Rather than suppress the table, the imbalance is stated and the
+ * prediction is withheld when it rests on almost nothing.
+ */
+const MIN_FOR_PREDICTION = 15;
+
+function coverageWarning(c) {
+  const nA = c.a.views.length, nB = c.b.views.length;
+  const low = Math.min(nA, nB);
+  const bits = [];
+
+  if (low < MIN_FOR_PREDICTION) {
+    const who = nA < nB ? c.a.apiName : c.b.apiName;
+    bits.push(`**${who}** has only **${low}** matches in this archive, which cannot ` +
+      `support a rate. No favourite is claimed.`);
+  } else if (Math.max(nA, nB) >= low * 4) {
+    bits.push(`Sample sizes are lopsided (**${nA}** against **${nB}**), so the two ` +
+      `columns are not equally informative.`);
+  }
+  return bits.length ? bits.join(' ') : null;
 }
 
 /** Render an api-tennis comparison into the same shape /compare produces. */
 function apiEmbed(c) {
   const favourite = c.pred.pA >= 0.5 ? c.a.apiName : c.b.apiName;
   const favP = Math.max(c.pred.pA, c.pred.pB);
+  const warn = coverageWarning(c);
+  const tooThin = Math.min(c.a.views.length, c.b.views.length) < MIN_FOR_PREDICTION;
 
   const e = new EmbedBuilder()
-    .setColor(0xe67e22)
+    .setColor(tooThin ? 0x8f8f8f : 0xe67e22)
     .setTitle(`${c.a.apiName}  vs  ${c.b.apiName}`)
     .setDescription(
-      `**${favourite}** favoured at **${(favP * 100).toFixed(0)}%** on the stats\n` +
+      (tooThin
+        ? `_Too little history to name a favourite._\n`
+        : `**${favourite}** favoured at **${(favP * 100).toFixed(0)}%** on the stats\n`) +
       `Head to head: **${c.h2h.aWins}-${c.h2h.bWins}**` +
       (c.h2h.n ? ` in ${c.h2h.n} meeting${c.h2h.n === 1 ? '' : 's'}` : ' — never met') + '\n' +
+      `Record: **${c.a.record}** and **${c.b.record}**\n` +
       `_${c.tour.toUpperCase()} · ${c.a.views.length} and ${c.b.views.length} matches ` +
-      `on record, ${c.fromYear}-${c.toYear}_`
+      `on record, ${c.fromYear}-${c.toYear}_` +
+      (warn ? `\n\n⚠️ ${warn}` : '')
     )
     .addFields(
       { name: 'Rank and surface', value: `${apiMetaLine(c.a)}\n${apiMetaLine(c.b)}` },
