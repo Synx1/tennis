@@ -74,6 +74,7 @@ const predictor = require('./src/tennispredict');
 const live = require('./src/tennislive');
 const core = require('./src/tenniscore');
 const api = require('./src/tennisapi');
+const board = require('./src/tennisboard');
 
 /**
  * Token for THIS application. TENNIS_BOT_TOKEN only — never DISCORD_TOKEN.
@@ -391,11 +392,22 @@ const COMMANDS = [
 
   new SlashCommandBuilder()
     .setName('matches')
-    .setDescription('Live and upcoming matches across ATP, WTA, Challenger and ITF')
+    .setDescription('Live scores and upcoming matches — auto-refreshing')
     .addBooleanOption(o => o.setName('live')
       .setDescription('Only matches already in progress (default: off)'))
-    .addBooleanOption(o => o.setName('all')
-      .setDescription('Also include scheduled matches with no history (default: off)'))
+    .addStringOption(o => o.setName('level')
+      .setDescription('Restrict to one level')
+      .addChoices(
+        { name: 'ATP', value: 'ATP' },
+        { name: 'WTA', value: 'WTA' },
+        { name: 'Challenger (men)', value: 'Challenger M' },
+        { name: 'Challenger (women)', value: 'Challenger W' },
+        { name: 'ITF (men)', value: 'ITF M' },
+        { name: 'ITF (women)', value: 'ITF W' },
+        { name: 'Boys', value: 'Boys' },
+        { name: 'Girls', value: 'Girls' }))
+    .addBooleanOption(o => o.setName('odds')
+      .setDescription('Show bookmaker prices (default: on)'))
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -716,6 +728,37 @@ async function apiComparison(tour, nameA, nameB, { around = new Date() } = {}) {
     return { error: `api-tennis has no ${tour.toUpperCase()} singles record for ` +
       `**${missing.join('** or **')}**.` };
   }
+  return apiComparisonResolved(tour, ka, kb);
+}
+
+/**
+ * The same comparison when both api-tennis keys are already known.
+ *
+ * The board hands these over directly, so the fixture-scanning lookup that
+ * apiComparison needs is skipped entirely. The player's display name is taken from
+ * their profile, since a key carries no name of its own.
+ */
+async function apiComparisonByKey(tour, keyA, keyB) {
+  if (!api.available()) {
+    return { error: 'API_TENNIS_KEY is not configured.' };
+  }
+  if (!keyA || !keyB) return { error: 'That match is missing a player id.' };
+
+  const [prA, prB] = await Promise.all([
+    api.playerProfile(keyA).catch(() => null),
+    api.playerProfile(keyB).catch(() => null)
+  ]);
+  const nameOf = (pr, k) => (pr && pr.player_name) ? String(pr.player_name).trim() : `#${k}`;
+
+  return apiComparisonResolved(
+    tour,
+    { key: String(keyA), apiName: nameOf(prA, keyA) },
+    { key: String(keyB), apiName: nameOf(prB, keyB) },
+    { prA, prB });
+}
+
+/** Shared body: load both histories, profile them, predict. */
+async function apiComparisonResolved(tour, ka, kb, pre = {}) {
   if (ka.key === kb.key) return { error: 'Those resolve to the same player.' };
 
   const toYear = new Date().getUTCFullYear();
@@ -724,8 +767,8 @@ async function apiComparison(tour, nameA, nameB, { around = new Date() } = {}) {
   const [mA, mB, prA, prB] = await Promise.all([
     api.playerMatches(ka.key, { fromYear, toYear, tour, log: line }),
     api.playerMatches(kb.key, { fromYear, toYear, tour, log: line }),
-    api.playerProfile(ka.key).catch(() => null),
-    api.playerProfile(kb.key).catch(() => null)
+    pre.prA !== undefined ? Promise.resolve(pre.prA) : api.playerProfile(ka.key).catch(() => null),
+    pre.prB !== undefined ? Promise.resolve(pre.prB) : api.playerProfile(kb.key).catch(() => null)
   ]);
 
   // One pool, so head-to-head sees both sides of every meeting exactly once.
@@ -733,12 +776,35 @@ async function apiComparison(tour, nameA, nameB, { around = new Date() } = {}) {
   for (const m of [...mA, ...mB]) byEvent.set(m.eventKey || Math.random(), m);
   const pool = [...byEvent.values()];
 
-  const vA = stats.forPlayer(pool, ka.apiName);
-  const vB = stats.forPlayer(pool, kb.apiName);
+  /**
+   * The name to look the player up by, inferred from their own matches.
+   *
+   * playerMatches(key) returns only that player's fixtures, so their name is the one
+   * appearing in EVERY row — which is a more reliable identifier than the profile's
+   * `player_name`. Those two are usually identical, but the profile is a separate
+   * endpoint and a spelling difference there would silently produce an empty record.
+   */
+  const nameFromMatches = (rows, fallback) => {
+    const count = new Map();
+    for (const m of rows) {
+      for (const n of [m.winner, m.loser]) count.set(n, (count.get(n) || 0) + 1);
+    }
+    let best = fallback, bestN = 0;
+    for (const [n, c] of count) if (c > bestN) { best = n; bestN = c; }
+    return best;
+  };
+
+  const dispA = nameFromMatches(mA, ka.apiName);
+  const dispB = nameFromMatches(mB, kb.apiName);
+
+  const vA = stats.forPlayer(pool, dispA);
+  const vB = stats.forPlayer(pool, dispB);
   if (!vA.length || !vB.length) {
     return { error: `api-tennis returned no completed singles matches for ` +
-      `**${!vA.length ? ka.apiName : kb.apiName}** in ${fromYear}-${toYear}.` };
+      `**${!vA.length ? dispA : dispB}** in ${fromYear}-${toYear}.` };
   }
+  ka = { ...ka, apiName: dispA };
+  kb = { ...kb, apiName: dispB };
 
   // No surface: api-tennis fixtures do not carry one, so a surface split here would
   // be an empty set dressed up as a statistic.
@@ -801,7 +867,270 @@ function apiEmbed(c) {
   return e;
 }
 
+// ── the live board ──────────────────────────────────────────────
+
+/** "6-3 3-6 4-1", with the set in progress marked. */
+function fmtSets(e) {
+  if (!e.sets.length) return '';
+  return e.sets.map(([a, b], idx) => {
+    const last = idx === e.sets.length - 1;
+    const decided = a > b || b > a ? Math.max(a, b) >= 6 : false;
+    const s = `${a}-${b}`;
+    return (e.state === 'live' && last && !decided) ? `__${s}__` : s;
+  }).join(' ');
+}
+
+/** A player's name with a serve marker and set count. */
+function fmtSide(e, side) {
+  const name = side === 'A' ? e.playerA : e.playerB;
+  const serving = e.state === 'live' && e.serving === side;
+  const leading = side === 'A' ? e.setsWonA > e.setsWonB : e.setsWonB > e.setsWonA;
+  const label = leading ? `**${name}**` : name;
+  return `${serving ? '🎾 ' : ''}${label}`;
+}
+
+/** Market prices as decimals plus the de-vigged percentage. */
+function fmtOdds(o) {
+  if (!o || !o.decimalA || !o.decimalB) return null;
+  const pc = p => p == null ? '—' : `${Math.round(p * 100)}%`;
+  return `${o.decimalA.toFixed(2)} / ${o.decimalB.toFixed(2)}  (${pc(o.pA)} / ${pc(o.pB)})`;
+}
+
+/**
+ * The live markets worth showing beneath a scoreline.
+ *
+ * The outright already appears on the odds line, so this adds only what is specific
+ * to being in play: who the book favours for the CURRENT set and the current game,
+ * and whether it expects a decider.
+ */
+function fmtLiveMarkets(m) {
+  const lo = m.liveOdds;
+  if (!lo) return null;
+  const bits = [];
+  const short = (o) => o && o.pA != null
+    ? `${Math.round(o.pA * 100)}/${Math.round(o.pB * 100)}` : null;
+
+  const sw = short(lo.setWinner);
+  if (sw && lo.setNo) bits.push(`set ${lo.setNo} \`${sw}\``);
+  const gw = short(lo.gameWinner);
+  if (gw) bits.push(`game \`${gw}\``);
+  if (lo.goesToDecider && isFinite(lo.goesToDecider.value)) {
+    bits.push(`decider ${lo.goesToDecider.value.toFixed(2)}`);
+  }
+  if (lo.outright && lo.outright.suspended) bits.push('_suspended_');
+  return bits.length ? bits.join(' · ') : null;
+}
+
+function fmtClock(ms, tz) {
+  if (!ms) return 'TBC';
+  const d = new Date(ms), now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const tomorrow = new Date(now.getTime() + 86400000).toDateString() === d.toDateString();
+  const t = d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
+  if (sameDay) return t;
+  if (tomorrow) return `tmrw ${t}`;
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: tz });
+}
+
+/**
+ * The board as an embed.
+ *
+ * Live matches get their own field each, because a scoreline plus a server plus a
+ * game score plus a price does not survive being squeezed onto one line. Upcoming
+ * matches are one line each, since only the time and the price matter before play.
+ */
+function boardEmbed(snap, { liveOnly, level, withOdds }) {
+  const TZ = snap.timezone;
+  const e = new EmbedBuilder()
+    .setColor(snap.live.length ? 0xed4245 : 0x1abc9c)
+    .setTitle(snap.live.length
+      ? `🔴 ${snap.live.length} match${snap.live.length === 1 ? '' : 'es'} in progress`
+      : 'Upcoming tennis');
+
+  const mix = Object.entries(snap.byLevel).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} ${v}`).join(' · ');
+
+  e.setDescription(
+    (level ? `Filtered to **${level}**. ` : '') +
+    `${snap.live.length} live · ${snap.upcoming.length} upcoming` +
+    (mix ? `\n${mix}` : '') +
+    `\n\n🎾 marks the server. Times ${TZ.split('/')[1].replace('_', ' ')}.` +
+    (withOdds ? ' Prices are the median across books, de-vigged.' : '')
+  );
+
+  // Discord allows 25 fields; live detail is worth more than upcoming volume.
+  const liveShown = snap.live.slice(0, 10);
+  for (const m of liveShown) {
+    const line1 = [];
+    const sets = fmtSets(m);
+    if (sets) line1.push(`\`${sets}\``);
+    if (m.game) line1.push(`pts \`${m.game}\``);
+    const o = withOdds ? fmtOdds(m.odds) : null;
+    if (o) line1.push(`${o}${m.odds && m.odds.live ? ' · live' : ''}`);
+
+    const lines = [
+      `${fmtSide(m, 'A')}  vs  ${fmtSide(m, 'B')}`,
+      line1.join(' · ') || m.status
+    ];
+    const lm = withOdds ? fmtLiveMarkets(m) : null;
+    if (lm) lines.push(lm);
+
+    e.addFields({
+      name: `${m.level} · ${m.tournament}${m.round ? ' · ' + m.round : ''}` +
+        (m.qualifying ? ' (Q)' : ''),
+      value: lines.join('\n').slice(0, 1024)
+    });
+  }
+  if (snap.live.length > liveShown.length) {
+    e.addFields({ name: '\u200b', value: `_+${snap.live.length - liveShown.length} more live_` });
+  }
+
+  if (!liveOnly && snap.upcoming.length) {
+    const room = Math.max(0, 24 - e.data.fields.length);
+    const lines = snap.upcoming.slice(0, 12).map(m => {
+      const o = withOdds ? fmtOdds(m.odds) : null;
+      return `\`${fmtClock(m.startMs, TZ).padEnd(9)}\` ${m.playerA} vs ${m.playerB}` +
+        ` · ${m.level}${o ? ` · ${o.split('  ')[0]}` : ''}`;
+    });
+    if (room > 0 && lines.length) {
+      e.addFields({
+        name: `Next up (${snap.upcoming.length})`,
+        value: lines.join('\n').slice(0, 1024)
+      });
+    }
+  }
+
+  e.setFooter({ text: 'api-tennis · refreshes automatically for ~14 min' });
+  e.setTimestamp(snap.updatedAt);
+  return e;
+}
+
+/** The picker, carrying api-tennis player keys so nothing is re-resolved by name. */
+function boardMenu(snap, liveOnly) {
+  const pool = [...snap.live, ...(liveOnly ? [] : snap.upcoming)].slice(0, 25);
+  if (!pool.length) return null;
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('pickmatch')
+      .setPlaceholder('Compare a match…')
+      .addOptions(pool.map(m => {
+        // Player KEYS, not names. api-tennis gives them on every row, so the pick
+        // needs no surname reconstruction and cannot resolve to the wrong person.
+        const tour = /women|wta|girls/i.test(m.eventType) ? 'wta' : 'atp';
+        const value = `k|${tour}|${m.keyA}|${m.keyB}`.slice(0, 100);
+        const bits = [m.level];
+        if (m.state === 'live') {
+          const s = fmtSets(m).replace(/__/g, '');
+          bits.push(s ? `LIVE ${s}` : 'LIVE');
+        } else {
+          bits.push(fmtClock(m.startMs, snap.timezone));
+        }
+        if (m.round) bits.push(m.round);
+        return {
+          label: `${m.playerA} vs ${m.playerB}`.slice(0, 100),
+          value,
+          description: bits.join(' · ').slice(0, 100),
+          emoji: m.state === 'live' ? '🔴' : '🎾'
+        };
+      })));
+}
+
+/**
+ * Keep editing the message while anything is live.
+ *
+ * Bounded at 14 minutes because an interaction token expires at 15 and every edit
+ * after that fails. Stops early once nothing is in progress, so a quiet board is not
+ * polled all afternoon. Any edit failure ends the loop rather than retrying into a
+ * dead token.
+ */
+const REFRESH_MS = 25000;
+const REFRESH_LIMIT_MS = 14 * 60 * 1000;
+
+function startBoardRefresh(interaction, opts) {
+  const until = Date.now() + REFRESH_LIMIT_MS;
+
+  const tick = async () => {
+    if (Date.now() > until) return;
+    await new Promise(r => setTimeout(r, REFRESH_MS));
+    if (Date.now() > until) {
+      try {
+        await interaction.editReply({
+          content: '_Auto-refresh stopped after 14 minutes. Run `/matches` again._'
+        });
+      } catch (_) { /* token gone; nothing to do */ }
+      return;
+    }
+
+    let snap;
+    try {
+      snap = await board.snapshot({
+        days: 2, withOdds: opts.withOdds,
+        levels: opts.level ? [opts.level] : null
+      });
+    } catch (_) {
+      return tick();               // transient API problem, try the next tick
+    }
+
+    try {
+      const menu = boardMenu(snap, opts.liveOnly);
+      await interaction.editReply({
+        embeds: [boardEmbed(snap, opts)],
+        components: menu ? [menu] : []
+      });
+    } catch (_) {
+      return;                      // message or token gone
+    }
+
+    // Nothing live and nothing about to start: stop rather than idle.
+    if (!snap.live.length && !snap.upcoming.length) return;
+    return tick();
+  };
+
+  tick().catch(() => {});
+}
+
 async function onMatches(i) {
+  const liveOnly = i.options.getBoolean('live') || false;
+  const level = i.options.getString('level') || null;
+  const withOdds = i.options.getBoolean('odds') !== false;
+
+  let snap;
+  try {
+    snap = await board.snapshot({
+      days: 2, withOdds, levels: level ? [level] : null
+    });
+  } catch (e) {
+    return i.editReply(
+      `Could not reach api-tennis: ${e.message}\n` +
+      `_Set \`API_TENNIS_KEY\` if it is not configured._`);
+  }
+
+  if (!snap.live.length && !snap.upcoming.length) {
+    return i.editReply(level
+      ? `Nothing live or scheduled at **${level}** in the next 2 days.`
+      : 'No live or upcoming singles matches in the next 2 days.');
+  }
+  if (liveOnly && !snap.live.length) {
+    return i.editReply(
+      `Nothing in progress right now${level ? ` at ${level}` : ''}. ` +
+      `${snap.upcoming.length} scheduled — run \`/matches\` without \`live:true\`.`);
+  }
+
+  const opts = { liveOnly, level, withOdds };
+  const menu = boardMenu(snap, liveOnly);
+  await i.editReply({
+    embeds: [boardEmbed(snap, opts)],
+    components: menu ? [menu] : []
+  });
+
+  // Only worth refreshing if something is actually in progress.
+  if (snap.live.length) startBoardRefresh(i, opts);
+  return;
+}
+
+/** Retained for reference: the old Kalshi-sourced path. */
+async function onMatchesKalshi(i) {
   const showAll = i.options.getBoolean('all') || false;
   const liveOnly = i.options.getBoolean('live') || false;
 
@@ -1016,11 +1345,30 @@ function h2hForNames(matches, aNames, bNames) {
 }
 
 async function onPickMatch(i) {
-  // Everything in the value was produced by a lookup that already succeeded: the
-  // tour comes from Kalshi, and the names are exact history names. Nothing is
-  // re-resolved from a surname here, which is what previously reintroduced the
-  // ambiguity that coverage had already settled.
-  const [tourRaw, rawA, rawB] = String(i.values[0]).split('|');
+  const value = String(i.values[0]);
+
+  /**
+   * "k|tour|keyA|keyB" — api-tennis player keys, straight off the board.
+   *
+   * This is the whole point of sourcing fixtures from api-tennis: the row already
+   * carries first_player_key and second_player_key, so a pick needs no name
+   * reconstruction at all. Every wrong-person failure so far came from rebuilding a
+   * name and re-resolving it; here there is nothing to rebuild.
+   */
+  if (value.startsWith('k|')) {
+    const [, tourRaw, keyA, keyB] = value.split('|');
+    const tour = tourRaw === 'wta' ? 'wta' : 'atp';
+    const c = await apiComparisonByKey(tour, keyA, keyB);
+    if (c.error) return i.editReply(c.error);
+    return i.editReply({
+      content: comparisonBlock(c.a.apiName, c.b.apiName, c.a.profile, c.b.profile, null),
+      embeds: [apiEmbed(c)]
+    });
+  }
+
+  // Legacy Kalshi-sourced value: "tour|nameA|nameB", names already resolved against
+  // tour-level history. Kept so a menu posted before a restart still works.
+  const [tourRaw, rawA, rawB] = value.split('|');
   const tour = (tourRaw === 'atp' || tourRaw === 'wta') ? tourRaw : 'atp';
   const { matches, names } = await history(tour);
 
