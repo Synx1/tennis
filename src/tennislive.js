@@ -22,11 +22,118 @@
  *
  * The title also carries the round ("Round Of 16"), and the two markets' yes prices
  * give a de-vigged market probability for free.
+ *
+ * ── which series, and why five rather than two ──
+ *
+ * Querying only KXATPMATCH and KXWTAMATCH was hiding almost everything. Measured
+ * 2026-08-09 against /series?category=Sports, the open board is:
+ *
+ *   KXITFWMATCH           106 open   ITF Women's Match
+ *   KXATPCHALLENGERMATCH   92 open   Challenger ATP
+ *   KXITFMATCH             40 open   ITF Men's Match
+ *   KXATPMATCH              8 open   ATP Tennis Match
+ *   KXWTAMATCH              8 open   WTA Tennis Match
+ *
+ * So the two tour-level series are 16 of 254 open markets, about 6%. Every ongoing
+ * match a user could see on Kalshi's tennis page and not in `/matches` was in one of
+ * the three missing series. KXCHALLENGERMATCH and KXWTACHALLENGERMATCH also exist as
+ * series but returned 0 open markets, so they are listed and skipped for free rather
+ * than special-cased.
+ *
+ * `historyTour` is separate from the series key on purpose. Name resolution has to
+ * happen inside ONE tour's player list — that is the fix that stopped "Zhu" resolving
+ * to "Zhukayev" — so ITF men and Challengers resolve against the ATP list and ITF
+ * women against the WTA list, while `level` keeps the real competition visible in the
+ * UI. Most ITF and Challenger players are not in tour-level history at all, which is
+ * expected and is reported rather than hidden.
  */
 
 const kalshi = require('./kalshi');
 
-const SERIES = { atp: 'KXATPMATCH', wta: 'KXWTAMATCH' };
+/**
+ * Every tennis match series on Kalshi that carries open markets.
+ *
+ *   ticker       Kalshi series ticker
+ *   label        what to show a user
+ *   historyTour  which player list to resolve names against ('atp' | 'wta')
+ */
+const SERIES_DEFS = {
+  atp:        { ticker: 'KXATPMATCH',           label: 'ATP',       historyTour: 'atp' },
+  wta:        { ticker: 'KXWTAMATCH',           label: 'WTA',       historyTour: 'wta' },
+  challenger: { ticker: 'KXATPCHALLENGERMATCH', label: 'Challenger', historyTour: 'atp' },
+  itfm:       { ticker: 'KXITFMATCH',           label: 'ITF M',     historyTour: 'atp' },
+  itfw:       { ticker: 'KXITFWMATCH',          label: 'ITF W',     historyTour: 'wta' }
+};
+
+/** Back-compat: the old shape was { atp: 'KXATPMATCH', wta: 'KXWTAMATCH' }. */
+const SERIES = Object.fromEntries(
+  Object.entries(SERIES_DEFS).map(([k, v]) => [k, v.ticker]));
+
+/**
+ * How long after the scheduled start a match is still treated as possibly ongoing.
+ *
+ * Kalshi leaves a market open until settlement, up to two weeks after play, so the
+ * feed cannot say "finished" and this window is the only thing standing in for it.
+ * Five sets can run past four hours and start times slip, so six hours is the point
+ * past which "still playing" stops being credible.
+ */
+const LIVE_WINDOW_MS = 6 * 3600 * 1000;
+
+const MONTHS = {
+  JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
+  JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11
+};
+
+/**
+ * The UTC date encoded in an event ticker, at midnight, or null.
+ *
+ * Tickers are "KXITFWMATCH-26AUG08ZHAZHU" — series, then a 2-digit year, a 3-letter
+ * month and a 2-digit day, then the two players' name fragments.
+ */
+function tickerDateUTC(eventTicker) {
+  const m = String(eventTicker || '').match(/-(\d{2})([A-Z]{3})(\d{2})/);
+  if (!m) return null;
+  const [, yy, mon, dd] = m;
+  if (!(mon in MONTHS)) return null;
+  return Date.UTC(2000 + Number(yy), MONTHS[mon], Number(dd));
+}
+
+/** Midnight UTC of the day containing a timestamp. */
+function dayUTC(ms) {
+  const d = new Date(ms);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/**
+ * Has this match begun, judged on Kalshi disagreeing with itself?
+ *
+ * `occurrence_datetime` goes STALE once a match is under way: it keeps advertising a
+ * scheduled slot that has already been overtaken, while the event ticker keeps the
+ * real date. Measured across all five series on 2026-08-09T04:30Z:
+ *
+ *   ticker date == occurrence date   127 events   max combined volume    110,595
+ *   ticker date EARLIER              2 events     combined volume  1,171,946 and 1,062,586
+ *   ticker date LATER                0 events
+ *
+ * The two disagreeing events were the W15 and M15 Tianjin finals, both of which
+ * Kalshi's own web UI was showing with a live set-by-set score while their
+ * occurrence_datetime sat four and a half hours in the FUTURE. Their volume is an
+ * order of magnitude above the busiest agreeing event, which is what being traded
+ * in play looks like. Nothing disagrees in the other direction, so this is not noise.
+ *
+ * The market being OPEN is the second half of the argument. Every one of these
+ * carries `can_close_early` with the condition "This market will close and expire
+ * after a winner is declared", so an open market is a match with no winner yet.
+ * Ticker date before occurrence date, plus still open, means started and unfinished.
+ *
+ * This is a workaround for a feed inconsistency, not a documented field, so it is
+ * isolated here and named for what it detects rather than being inlined.
+ */
+function scheduleIsStale(eventTicker, startMs) {
+  const td = tickerDateUTC(eventTicker);
+  if (td == null || startMs == null || !isFinite(startMs)) return false;
+  return td < dayUTC(startMs);
+}
 
 /** Last word of a name, lowercased. The usual surname. */
 function surnameOf(name) {
@@ -59,20 +166,56 @@ function surnameKeys(name) {
 }
 
 /**
- * Tournament name from a market title.
- * 
- * Titles like "Will Jannik Sinner win the Sinner vs Alcaraz: Round Of 16 match?"
- * The "win the X" portion before the colon often contains match info but not a clear
- * tournament. The event_ticker (e.g. KXATPMATCH-2026-08-09-R16-USOPEN) is more reliable.
+ * The segment of a title between the colon and "match?".
+ *
+ * Titles are "Will <player> win the <A> vs <B>: <segment> match?" and the segment
+ * carries the tournament and the round together, or just the round at tour level:
+ *
+ *   ATP  "...Van de Zandschulp vs Mensik: Round Of 16 match?"        -> "Round Of 16"
+ *   ITF  "...Laborde vs Senn: M25 Muttenz Round of 32 match?"        -> "M25 Muttenz Round of 32"
+ *   ITF  "...Vandewinkel vs Zakharova: W100 Landisville PA Final match?"
+ *                                                    -> "W100 Landisville PA Final"
  */
-function tournamentFromTicker(ticker) {
-  // Extract tournament from ticker like "KXATPMATCH-2026-08-09-R16-USOPEN"
-  const parts = String(ticker || '').split('-');
-  if (parts.length >= 5) {
-    const tourney = parts.slice(4).join(' ');
-    return tourney || null;
-  }
-  return null;
+function detailFrom(title) {
+  const m = String(title || '').match(/:\s*([^?]+?)\s+match\?/i);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Round names Kalshi uses, longest first so "Round of 128" is not clipped to
+ * "Round of 12" and "Quarterfinal" is preferred over a bare "Final" suffix match.
+ */
+const ROUND_RE = new RegExp(
+  '(' + [
+    'Round\\s*Of\\s*\\d+',
+    'Round\\s*\\d+',
+    'R\\d+',
+    'Qualifying\\s+(?:Final|Round\\s*\\d+|\\d+)',
+    'Quarterfinals?', 'Quarter\\s*Final', 'QF',
+    'Semifinals?', 'Semi\\s*Final', 'SF',
+    'Final'
+  ].join('|') + ')\\s*$', 'i');
+
+/**
+ * Split the title's detail segment into tournament and round.
+ *
+ * The round is always the TRAILING part, so it is matched at the end of the string
+ * and whatever precedes it is the tournament. Anchoring at the end is what keeps
+ * "W100 Landisville PA Final" from reading "Landisville" as a round, and stops the
+ * tournament swallowing the round on ITF titles.
+ *
+ * At tour level there is no tournament in the title, so the whole segment is a round
+ * and the tournament comes back null rather than being invented.
+ */
+function splitDetail(detail) {
+  if (!detail) return { tournament: null, round: null };
+
+  const m = detail.match(ROUND_RE);
+  if (!m) return { tournament: detail || null, round: null };
+
+  const round = m[1].trim();
+  const tournament = detail.slice(0, m.index).trim();
+  return { tournament: tournament || null, round };
 }
 
 /**
@@ -82,8 +225,12 @@ function tournamentFromTicker(ticker) {
  * the colon and the trailing word. Absent on some listings, hence the null.
  */
 function roundFrom(title) {
-  const m = String(title || '').match(/:\s*([^?]+?)\s+match\?/i);
-  return m ? m[1].trim() : null;
+  return splitDetail(detailFrom(title)).round;
+}
+
+/** Tournament from a market title, or null at tour level where the title omits it. */
+function tournamentFrom(title) {
+  return splitDetail(detailFrom(title)).tournament;
 }
 
 /** "A vs B" portion of the title, useful when sub-titles are missing. */
@@ -93,15 +240,18 @@ function pairFrom(title) {
 }
 
 /**
- * Open matches for a tour, soonest first.
+ * Open matches for one series, live first then soonest.
  *
  * One Kalshi EVENT is one match and holds two markets, one per player. Grouping by
  * event_ticker and taking each market's `yes_sub_title` gives both names with no
  * parsing of prose.
+ *
+ * @param {string} key  a key of SERIES_DEFS ('atp' | 'wta' | 'challenger' | 'itfm' | 'itfw')
  */
-async function upcomingForTour(tour) {
-  const series = SERIES[tour];
-  if (!series) return [];
+async function upcomingForTour(key) {
+  const def = SERIES_DEFS[key];
+  if (!def) return [];
+  const series = def.ticker;
 
   let open;
   try { open = await kalshi.getOpenMarkets(series) || []; }
@@ -151,15 +301,24 @@ async function upcomingForTour(tour) {
     if (uniq.length < 2) continue;
 
     const startMs = uniq.map(s => s.startMs).find(t => isFinite(t)) || null;
-    
-    // Calculate match status
-    const isUpcoming = !startMs || startMs > now;
-    const isLive = startMs && startMs <= now && startMs > now - 6 * 3600 * 1000;
-    const isFinished = startMs && startMs < now - 6 * 3600 * 1000;
-    
-    // Drop matches that finished more than six hours ago; Kalshi keeps them open
-    // until settlement, which is up to two weeks after play.
-    if (isFinished) continue;
+
+    // A stale schedule is positive evidence the match has begun, and it overrides
+    // the clock — for these, occurrence_datetime points into the future even though
+    // play has started, so a purely time-based test calls them "upcoming" and sorts
+    // them below matches that have not begun.
+    const stale = scheduleIsStale(ev, startMs);
+
+    // Started per the clock, and recently enough that "still playing" is credible.
+    const startedRecently = startMs != null &&
+      startMs <= now && startMs > now - LIVE_WINDOW_MS;
+
+    const isLive = stale || startedRecently;
+    const isUpcoming = !isLive && (startMs == null || startMs > now);
+
+    // Finished: the clock says it began long enough ago to be over, and there is no
+    // stale-schedule evidence that it is still going. Kalshi keeps markets open
+    // until settlement, up to two weeks after play, so this has to be inferred.
+    if (!isLive && startMs != null && startMs <= now - LIVE_WINDOW_MS) continue;
 
     // Mid price per side, then normalised so the pair sums to one.
     const mid = s => {
@@ -170,8 +329,14 @@ async function upcomingForTour(tour) {
     const mA = mid(uniq[0]), mB = mid(uniq[1]);
     const sum = mA + mB;
 
+    const detail = splitDetail(detailFrom(uniq[0].title));
+
     out.push({
-      tour,
+      // `tour` stays 'atp' or 'wta' because it selects the player list to resolve
+      // names against, and it is what the menu round-trips to /compare.
+      tour: def.historyTour,
+      series: key,
+      level: def.label,
       eventTicker: ev,
       playerA: uniq[0].name,
       playerB: uniq[1].name,
@@ -180,9 +345,12 @@ async function upcomingForTour(tour) {
       startMs,
       isLive,
       isUpcoming,
-      round: roundFrom(uniq[0].title),
+      // True when startMs is known to be unreliable, so callers do not present an
+      // elapsed time computed from a timestamp in the future.
+      startUnreliable: stale,
+      round: detail.round,
+      tournament: detail.tournament,
       pair: pairFrom(uniq[0].title),
-      tournament: tournamentFromTicker(ev),
       volume: uniq.reduce((s2, x) => s2 + x.volume, 0)
     });
   }
@@ -199,22 +367,45 @@ async function upcomingForTour(tour) {
   return out;
 }
 
-/** Open matches across both tours, live first then soonest upcoming. */
-async function upcoming({ limit = 25 } = {}) {
-  const [atp, wta] = await Promise.all([
-    upcomingForTour('atp'),
-    upcomingForTour('wta')
-  ]);
-  const all = [...atp, ...wta].sort((a, b) => {
-    // Live matches first, then upcoming
-    if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
-    
-    const ta = a.startMs == null ? Infinity : a.startMs;
-    const tb = b.startMs == null ? Infinity : b.startMs;
-    if (ta !== tb) return ta - tb;
-    return b.volume - a.volume;
-  });
-  return all.slice(0, limit);
+/**
+ * Live matches first, then soonest upcoming; ties broken on volume.
+ *
+ * Inside the live group the timestamp is not used. A stale-schedule match has a
+ * startMs pointing into the future, so ordering the live group by time would put the
+ * matches that are definitely under way BELOW ones that merely started late, which
+ * is backwards. Volume is the meaningful ranking there: in-play markets are the
+ * heavily traded ones.
+ */
+function byLiveThenSoonest(a, b) {
+  if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+  if (a.isLive) return b.volume - a.volume;
+
+  const ta = a.startMs == null ? Infinity : a.startMs;
+  const tb = b.startMs == null ? Infinity : b.startMs;
+  if (ta !== tb) return ta - tb;
+  return b.volume - a.volume;
+}
+
+/**
+ * Open matches across every tennis series, live first then soonest upcoming.
+ *
+ * All five series are fetched concurrently. `kalshi.get` serialises and throttles
+ * internally, so the concurrency here queues rather than bursting and cannot trip
+ * the rate limiter.
+ *
+ * @param {object} opts
+ *   limit   how many fixtures to return
+ *   series  restrict to specific SERIES_DEFS keys (default: all)
+ */
+async function upcoming({ limit = 25, series = Object.keys(SERIES_DEFS) } = {}) {
+  const lists = await Promise.all(series.map(k => upcomingForTour(k)));
+  return lists.flat().sort(byLiveThenSoonest).slice(0, limit);
+}
+
+/** Same as upcoming(), but only matches that have already started. */
+async function live({ limit = 25 } = {}) {
+  const all = await upcoming({ limit: Infinity });
+  return all.filter(f => f.isLive).slice(0, limit);
 }
 
 /** Market-implied probability. Kalshi prices are already normalised above. */
@@ -253,11 +444,15 @@ function splitByCoverage(fixtures, byTour) {
   const idx = {};
   for (const t of Object.keys(byTour)) idx[t] = indexBySurname(byTour[t] || []);
 
-  // Try each candidate key; still EXACT matches only, never a prefix.
+  // Try each candidate key; still EXACT matches only, never a prefix. The KEY that
+  // matched is returned alongside the names, because the caller needs to hand
+  // something back to the history layer and a surname re-derived from the full name
+  // is not guaranteed to be that key — "Botic Van de Zandschulp" is indexed under
+  // "van", not "zandschulp".
   const lookup = (names, full) => {
     for (const k of surnameKeys(full)) {
       const hit = names.get(k);
-      if (hit) return hit;
+      if (hit) return { key: k, names: hit };
     }
     return null;
   };
@@ -268,13 +463,20 @@ function splitByCoverage(fixtures, byTour) {
     if (!names) { uncovered.push(f); continue; }
     const a = lookup(names, f.playerA);
     const b = lookup(names, f.playerB);
-    if (a && b) covered.push({ ...f, resolvedA: a, resolvedB: b });
-    else uncovered.push(f);
+    if (a && b) {
+      covered.push({
+        ...f,
+        resolvedA: a.names, resolvedB: b.names,
+        keyA: a.key, keyB: b.key
+      });
+    } else uncovered.push(f);
   }
   return { covered, uncovered };
 }
 
 module.exports = {
-  upcoming, upcomingForTour, implied, surnameOf, surnameKeys, splitByCoverage,
-  indexBySurname, roundFrom, pairFrom, tournamentFromTicker, SERIES
+  upcoming, live, upcomingForTour, implied, surnameOf, surnameKeys, splitByCoverage,
+  indexBySurname, roundFrom, tournamentFrom, detailFrom, splitDetail, pairFrom,
+  byLiveThenSoonest, tickerDateUTC, dayUTC, scheduleIsStale,
+  SERIES, SERIES_DEFS, LIVE_WINDOW_MS
 };

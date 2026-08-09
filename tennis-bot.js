@@ -83,7 +83,27 @@ function normaliseName(s) {
   return String(s).toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function resolvePlayer(query, allNames) {
+/**
+ * Resolve a typed query to candidate history names.
+ *
+ * `exact` was previously read without being declared anywhere, which threw a
+ * ReferenceError rather than doing anything. The three branches guarded by it are
+ * only reached when none of the exact tiers match, so the crash was invisible for
+ * exact surnames and certain for everything else — including every menu pick of a
+ * particled name, because `surnameOf('Botic Van de Zandschulp')` yields
+ * "zandschulp" while the history is keyed on the leading token, "van".
+ *
+ * It is now a real parameter, defaulting to allowing prefixes for TYPED queries
+ * (where a user half-remembering a spelling is the normal case) and set true for
+ * anything resolved from a fixture, where a silent near-miss means showing the
+ * wrong player's statistics.
+ *
+ * @param {string} query
+ * @param {string[]} allNames
+ * @param {object} opts
+ *   exact  when true, only exact-tier matches count; no prefix or substring fallback
+ */
+function resolvePlayer(query, allNames, { exact = false } = {}) {
   const q = normaliseName(query);
   if (!q) return { matches: [] };
 
@@ -316,9 +336,11 @@ const COMMANDS = [
 
   new SlashCommandBuilder()
     .setName('matches')
-    .setDescription('Pick a live or upcoming match from a menu — no typing needed')
+    .setDescription('Live and upcoming matches across ATP, WTA, Challenger and ITF')
+    .addBooleanOption(o => o.setName('live')
+      .setDescription('Only matches already in progress (default: off)'))
     .addBooleanOption(o => o.setName('all')
-      .setDescription('Include matches we have no history for (default: off)'))
+      .setDescription('Also include scheduled matches with no history (default: off)'))
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -388,8 +410,8 @@ async function pointProfile(tour, setLevelName, setLevelViews) {
 }
 
 /** Resolve a query to one player, or explain why it could not be done. */
-function pick(query, names) {
-  const r = resolvePlayer(query, names);
+function pick(query, names, { exact = false } = {}) {
+  const r = resolvePlayer(query, names, { exact });
   if (!r.matches.length) return { error: `No player matching **${query}**.` };
   if (r.matches.length > 4) {
     return { error: `**${query}** matches ${r.matches.length} players. Be more specific.` };
@@ -568,20 +590,56 @@ async function allNames() {
 
 async function onMatches(i) {
   const showAll = i.options.getBoolean('all') || false;
-  const fixtures = await live.upcoming({ limit: 40 });
+  const liveOnly = i.options.getBoolean('live') || false;
+
+  // No limit here. Filtering happens AFTER coverage is known, so truncating the
+  // fetch would silently drop analysable matches in favour of unanalysable ones
+  // that merely start sooner.
+  let fixtures = await live.upcoming({ limit: Infinity });
   if (!fixtures.length) {
     return i.editReply('No open tennis matches on Kalshi right now.');
   }
 
+  const ongoing = fixtures.filter(f => f.isLive);
+  if (liveOnly) {
+    fixtures = ongoing;
+    if (!fixtures.length) {
+      return i.editReply(
+        `No tennis match has started in the last ${live.LIVE_WINDOW_MS / 3600000} hours. ` +
+        `Run \`/matches\` without \`live:true\` to see what is scheduled.`);
+    }
+  }
+
   const { byTour } = await allNames();
   const { covered, uncovered } = live.splitByCoverage(fixtures, byTour);
-  const list = (showAll ? [...covered, ...uncovered] : covered).slice(0, 25);
+
+  /**
+   * A LIVE match is shown whether or not we hold history for it.
+   *
+   * "What is on right now" is the question being asked, and answering it with an
+   * empty list because the players are ITF-level would be technically consistent
+   * and useless. ITF and Challenger make up 238 of the 254 open markets and almost
+   * none of those players appear in tour-level history, so the coverage filter alone
+   * hid every ongoing match. Unanalysable ones are still marked, so picking one
+   * explains itself rather than failing mysteriously.
+   */
+  // Keyed on eventTicker, not object identity. splitByCoverage returns spread
+  // COPIES of the covered fixtures, so an identity check against the original
+  // array silently reports every match as unanalysable.
+  const analysableIds = new Set(covered.map(f => f.eventTicker));
+  const shown = [
+    ...covered,
+    ...uncovered.filter(f => showAll || f.isLive)
+  ].sort(live.byLiveThenSoonest);
+
+  // Discord allows 25 options in one select menu.
+  const list = shown.slice(0, 25);
 
   if (!list.length) {
     return i.editReply(
-      `Found ${fixtures.length} open match(es), but none have both players in the ` +
-      `loaded history — Polymarket lists a lot of ITF futures and this data covers ` +
-      `tour level. Try \`/matches all:true\` to see them anyway.`);
+      `Found ${fixtures.length} open match(es), none of them in progress and none ` +
+      `with both players in the loaded history. Kalshi lists mostly ITF and ` +
+      `Challenger, and this history covers tour level. Try \`/matches all:true\`.`);
   }
 
   const fmtWhen = ms => {
@@ -606,13 +664,16 @@ async function onMatches(i) {
   };
   
   const fmtStatus = f => {
-    if (f.isLive) {
-      const elapsed = Math.floor((Date.now() - f.startMs) / 60000);
-      if (elapsed < 60) return `🔴 LIVE (${elapsed}m)`;
-      const hours = Math.floor(elapsed / 60);
-      return `🔴 LIVE (${hours}h ${elapsed % 60}m)`;
-    }
-    return fmtWhen(f.startMs);
+    if (!f.isLive) return fmtWhen(f.startMs);
+
+    // When the schedule is stale the timestamp points into the future, so an
+    // elapsed time computed from it would be negative or nonsense. Say LIVE and
+    // stop, rather than printing a number that is known to be wrong.
+    if (f.startUnreliable) return 'LIVE now';
+
+    const elapsed = Math.floor((Date.now() - f.startMs) / 60000);
+    if (elapsed < 60) return `LIVE ${elapsed}m in`;
+    return `LIVE ${Math.floor(elapsed / 60)}h${String(elapsed % 60).padStart(2, '0')} in`;
   };
 
   const menu = new StringSelectMenuBuilder()
@@ -620,21 +681,43 @@ async function onMatches(i) {
     .setPlaceholder('Choose a match…')
     .addOptions(list.map(f => {
       const label = `${f.playerA} vs ${f.playerB}`.slice(0, 100);
-      // The TOUR is carried in the value, not inferred later. Inferring it from a
-      // surname is what resolved "Zhu" to "Zhukayev": the surname existed in the
-      // wrong tour's list and was prefix-matched to a different player. Kalshi states
-      // the tour, so it is passed through.
-      const value = `${f.tour}|${live.surnameOf(f.playerA)}|${live.surnameOf(f.playerB)}`
-        .slice(0, 100);
-      const analysable = covered.includes(f);
-      
-      // Build description with status/time, tournament, round, and odds
-      const parts = [fmtStatus(f)];
+      const analysable = analysableIds.has(f.eventTicker);
+
+      /**
+       * What the menu hands back when this option is chosen.
+       *
+       * The TOUR is carried explicitly rather than inferred later. Inferring it from
+       * a surname is what resolved "Zhu" to "Zhukayev": the surname existed in the
+       * wrong tour's list and was prefix-matched to a different player.
+       *
+       * The NAMES are the exact history names when coverage resolved them to one
+       * player, otherwise the surname KEY that matched the index. Both come from the
+       * lookup that already succeeded, so they are guaranteed to resolve on the way
+       * back. Re-deriving a surname here with surnameOf() was wrong for particled
+       * names: "Botic Van de Zandschulp" gives "zandschulp" while the history is
+       * keyed on "van", so the round trip failed for exactly the players the
+       * surnameKeys() helper exists to handle.
+       */
+      const side = (resolved, key, fallback) => {
+        if (resolved && resolved.length === 1) return resolved[0];
+        if (key) return key;
+        return live.surnameKeys(fallback)[0] || fallback;
+      };
+      const value = [
+        f.tour,
+        side(f.resolvedA, f.keyA, f.playerA),
+        side(f.resolvedB, f.keyB, f.playerB)
+      ].join('|').slice(0, 100);
+
+      // Status/time first, then the competition, round, price, and any warning.
+      // `level` distinguishes ATP from ITF W, which matters now that five series
+      // are merged into one list.
+      const parts = [fmtStatus(f), f.level];
       if (f.tournament) parts.push(f.tournament);
       if (f.round) parts.push(f.round);
       parts.push(`${(f.priceA * 100).toFixed(0)}/${(f.priceB * 100).toFixed(0)}`);
       if (!analysable) parts.push('no history');
-      
+
       return {
         label,
         value,
@@ -643,22 +726,37 @@ async function onMatches(i) {
       };
     }));
 
+  // Count by level so the mix is visible; ATP/WTA are a small slice of the board.
+  const byLevel = {};
+  for (const f of fixtures) byLevel[f.level] = (byLevel[f.level] || 0) + 1;
+  const levelLine = Object.entries(byLevel)
+    .sort((x, y) => y[1] - x[1])
+    .map(([k, v]) => `${k} ${v}`)
+    .join(' · ');
+
+  const hiddenCount = shown.length - list.length;
+
   const e = new EmbedBuilder()
-    .setColor(0x1abc9c)
-    .setTitle('Live and upcoming matches')
+    .setColor(ongoing.length ? 0xed4245 : 0x1abc9c)
+    .setTitle(ongoing.length
+      ? `${ongoing.length} match${ongoing.length === 1 ? '' : 'es'} in progress`
+      : 'Upcoming matches')
     .setDescription(
-      `**${covered.length}** of ${fixtures.length} open matches have both players in ` +
-      `their own tour's history and can be analysed.` +
-      (showAll && uncovered.length
-        ? `\n${uncovered.length} shown without history — those will return little.`
-        : uncovered.length
-          ? `\n_${uncovered.length} hidden (no history for one or both players). ` +
-            `Use \`all:true\` to see them._`
-          : '') +
-      `\n\n🔴 = **LIVE NOW** (match in progress)\n` +
-      `🎾 = Both players in history (analysable)\n` +
-      `❔ = One or both players not in history\n\n` +
-      `Times are ET. Prices are Kalshi's live odds (devigged).`
+      `**${fixtures.length}** open match${fixtures.length === 1 ? '' : 'es'} across ` +
+      `ATP, WTA, Challenger and ITF — ${levelLine}.\n` +
+      `**${ongoing.length}** in progress · **${covered.length}** with both players in ` +
+      `their own tour's history.` +
+      (hiddenCount > 0
+        ? `\n_Showing the first 25; ${hiddenCount} more not listed (Discord menu limit)._`
+        : '') +
+      (!showAll && uncovered.some(f => !f.isLive)
+        ? `\n_${uncovered.filter(f => !f.isLive).length} scheduled match(es) hidden ` +
+          `for having no history. Use \`all:true\` to include them._`
+        : '') +
+      `\n\n🔴 in progress · 🎾 analysable · ❔ no tour-level history\n` +
+      `Live matches are always listed, with or without history.\n\n` +
+      `Times are ET, from Kalshi's \`occurrence_datetime\`. Prices are Kalshi's, ` +
+      `normalised to sum to 100 — the benchmark, not this bot's prediction.`
     )
     .setFooter({ text: 'Fixtures from Kalshi · stats from tennis-data.co.uk + MCP' });
 
@@ -678,13 +776,20 @@ async function onPickMatch(i) {
   const tour = (tourRaw === 'atp' || tourRaw === 'wta') ? tourRaw : 'atp';
   const { matches, names } = await history(tour);
 
-  const a = pick(snA, names);
-  const b = pick(snB, names);
+  // exact: true. A fixture pick must never fall back to a prefix — that is the
+  // "Zhu" -> "Zhukayev" failure, and showing a different player's career without
+  // saying so is worse than refusing. Live ITF and Challenger matches are listed
+  // whether or not history exists, so landing here with no match is expected and
+  // gets an explanation rather than a crash.
+  const a = pick(snA, names, { exact: true });
+  const b = pick(snB, names, { exact: true });
   if (a.error || b.error) {
     return i.editReply(
-      `${a.error || ''}${a.error && b.error ? '\n' : ''}${b.error || ''}\n` +
-      `_Resolved against ${tour.toUpperCase()} history. Try \`/compare\` with the ` +
-      `full name and an explicit tour._`);
+      `${a.error || ''}${a.error && b.error ? '\n' : ''}${b.error || ''}\n\n` +
+      `_Resolved against ${tour.toUpperCase()} history, exact surname only. Kalshi ` +
+      `lists mostly ITF and Challenger matches and this history covers tour level, ` +
+      `so most players below tour level are genuinely absent rather than misspelled. ` +
+      `Try \`/compare\` with full names and an explicit tour._`);
   }
 
   // Surface is unknown from the fixture feed, so career-wide figures are used and
